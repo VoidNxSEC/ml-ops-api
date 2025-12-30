@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  build-binaries:
+    name: Build Release Binaries
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: api
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd api/target/${{ matrix.target }}/release
+          tar -czf ml-offload-api-${{ matrix.target }}.tar.gz ml-offload-api
+          mv ml-offload-api-${{ matrix.target }}.tar.gz $GITHUB_WORKSPACE/
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ml-offload-api-${{ matrix.target }}.tar.gz
+
+  build-nix:
+    name: Build Nix Package
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v9
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v2
+
+      - name: Build Nix package
+        run: nix build --print-build-logs
+
+      - name: Create tarball
+        run: |
+          nix bundle --bundler github:NixOS/bundlers#toDockerImage
+          mv *.tar.gz ml-offload-api-nix.tar.gz
+
+      - name: Upload Nix artifact
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ml-offload-api-nix.tar.gz

@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      enable-tmate:
+        description: 'Enable tmate debug session'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Rust CI - Build, Test, Lint
+  rust-ci:
+    name: Rust CI
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, beta]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: api/target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        working-directory: api
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        working-directory: api
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        working-directory: api
+        run: cargo build --verbose --all-features
+
+      - name: Run tests
+        working-directory: api
+        run: cargo test --verbose --all-features
+
+      - name: Build release
+        working-directory: api
+        run: cargo build --release --verbose
+
+      - name: Upload binary artifact
+        if: matrix.rust == 'stable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-offload-api-binary
+          path: api/target/release/ml-offload-api
+          retention-days: 7
+
+  # Nix Flake CI
+  nix-ci:
+    name: Nix Flake CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v9
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v2
+
+      - name: Check flake
+        run: nix flake check --show-trace
+
+      - name: Build default package
+        run: nix build --print-build-logs
+
+      - name: Build Rust API
+        run: nix build .#rust --print-build-logs
+
+      - name: Build Python scripts
+        run: nix build .#python --print-build-logs
+
+      - name: Build all
+        run: nix build .#all --print-build-logs
+
+      - name: Test devShell
+        run: nix develop --command echo "DevShell OK"
+
+  # Security Audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        working-directory: api
+        run: cargo audit
+
+      - name: Check for outdated dependencies
+        working-directory: api
+        run: cargo outdated --exit-code 1 || true
+
+  # Coverage
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov
+
+      - name: Generate coverage
+        working-directory: api
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: api/lcov.info
+          fail_ci_if_error: false
+
+  # tmate Debug (on demand or failure)
+  debug:
+    name: Debug Session
+    runs-on: ubuntu-latest
+    if: failure() || inputs.enable-tmate
+    needs: [rust-ci, nix-ci]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          timeout-minutes: 30
