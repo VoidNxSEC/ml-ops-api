@@ -1,0 +1,116 @@
+[package]
+name = "tensorforge-backend-llamacpp"
+version = "0.1.0"
+edition = "2021"
+authors = ["kernelcore"]
+description = "llama.cpp backend implementation for TensorForge ML inference orchestration"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[dependencies]
+# Core TensorForge types and traits
+tensorforge-core = { path = "../../core", features = ["vram-monitoring", "config-file"] }
+
+# Workspace dependencies (re-exported from workspace)
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+async-trait = { workspace = true }
+validator = { version = "0.16", features = ["derive"] }
+futures = { workspace = true }
+
+# Additional dependencies for llama.cpp backend
+url = "2.4"
+bytes = "1.5"
+mime = "0.3"
+http = "1.0"
+hyper = { version = "0.14", features = ["client", "http1", "http2"] }
+hyper-tls = "0.5"
+backoff = "0.4"
+parking_lot = "0.12"
+once_cell = "1.19"
+arc-swap = "1.6"
+dashmap = "5.5"
+sysinfo = "0.30"
+lazy_static = "1.4"
+num_cpus = "1.16"
+
+# Prometheus metrics integration
+prometheus = { version = "0.13", optional = true }
+metrics = { version = "0.21", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full", "test-util", "rt-multi-thread"] }
+tracing-test = "0.2"
+tempfile = "3.8"
+assert_matches = "1.5"
+mockall = "0.12"
+wiremock = "0.5"
+serde_test = "1.0"
+
+[features]
+default = ["metrics"]
+metrics = ["dep:prometheus", "dep:metrics"]
+
+# Enable B200-specific optimizations
+b200-optimized = []
+
+# Enable all-layers-on-GPU optimization
+all-layers-on-gpu = []
+
+# Enable FlashAttention support
+flash-attention = []
+
+# Enable CUDA graphs optimization
+cuda-graphs = []
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+codegen-units = 256
+rpath = false
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.bench]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "unwind"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.test]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+codegen-units = 256
+rpath = false

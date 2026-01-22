@@ -1,0 +1,231 @@
+# TensorForge Configuration
+#
+# This is an example configuration file for TensorForge ML inference orchestration engine.
+# Copy this file to your config directory and adjust values as needed.
+
+[orchestrator]
+# Maximum batch size for dynamic batching
+max_batch_size = 256
+# Batch timeout in milliseconds
+batch_timeout_ms = 2000
+# Enable dynamic batching for better throughput
+enable_dynamic_batching = true
+# Maximum queue depth before rejecting requests
+max_queue_depth = 1000
+# Request timeout in seconds
+request_timeout_secs = 300
+# Enable request prioritization
+enable_prioritization = true
+# Number of worker threads (0 = auto-detect)
+worker_threads = 0
+# Health check interval in seconds
+health_check_interval_secs = 30
+# Number of models to keep in memory cache
+model_cache_size = 20
+# Automatically load models based on usage patterns
+auto_load_models = true
+
+[backends]
+# Default backend to use when not specified (vllm, llamacpp, auto)
+default_backend = "auto"
+# Enable automatic backend discovery
+auto_discovery = true
+# Backend selection strategy (latency, throughput, vram_efficiency, balanced, round_robin)
+selection_strategy = "balanced"
+
+[backends.vllm]
+# Enable vLLM backend
+enabled = true
+# vLLM API endpoint
+endpoint = "http://localhost:8000"
+# Tensor parallel size (4 for B200's 4-die architecture)
+tensor_parallel_size = 4
+# Pipeline parallel size
+pipeline_parallel_size = 2
+# Maximum model length (context) in tokens
+max_model_len = 131072
+# GPU memory utilization (0.0-1.0)
+gpu_memory_utilization = 0.95
+# Enable prefix caching for repeated prompts
+enable_prefix_caching = true
+# Enable FlashAttention for better performance
+enable_flash_attention = true
+# Quantization type (fp16, fp8, int8)
+quantization = "fp8"
+# Maximum concurrent requests
+max_concurrent_requests = 256
+# Request timeout in seconds
+request_timeout_secs = 300
+
+[backends.llamacpp]
+# Enable llama.cpp backend
+enabled = true
+# llama.cpp API endpoint
+endpoint = "http://localhost:8080"
+# Number of GPU layers to load (999 = all layers)
+n_gpu_layers = 999
+# Context length in tokens
+n_ctx = 32768
+# Batch size
+n_batch = 2048
+# Number of threads (0 = auto-detect)
+n_threads = 0
+# Number of threads for batch processing (0 = auto-detect)
+n_threads_batch = 0
+# Enable FlashAttention
+flash_attn = true
+# Enable CUDA graphs
+cuda_graphs = true
+# Rope scaling type
+rope_scaling_type = "linear"
+# Maximum concurrent requests
+max_concurrent_requests = 128
+# Request timeout in seconds
+request_timeout_secs = 300
+
+[metrics]
+# Enable Prometheus metrics endpoint
+prometheus_enabled = true
+# Prometheus metrics port
+prometheus_port = 9091
+# Enable cost tracking
+cost_tracking_enabled = true
+# Enable quality metrics
+quality_metrics_enabled = true
+# Metrics collection interval in seconds
+collection_interval_secs = 5
+# Enable detailed request metrics
+detailed_request_metrics = true
+# Enable GPU metrics collection
+gpu_metrics_enabled = true
+# Metrics retention period in hours
+retention_hours = 24
+
+[pipeline]
+# Enable checkpointing for fault tolerance
+checkpoint_enabled = true
+# Checkpoint interval (number of items)
+checkpoint_interval = 1000
+# Maximum retries for failed items
+max_retries = 3
+# Retry delay in milliseconds
+retry_delay_ms = 1000
+# Maximum parallel processing streams
+max_parallel_streams = 16
+# Input batch size
+input_batch_size = 1000
+# Output batch size
+output_batch_size = 1000
+# Enable result validation
+enable_validation = true
+# Validation timeout in seconds
+validation_timeout_secs = 30
+
+[api]
+# Enable API server
+enabled = true
+# Host to bind to
+host = "127.0.0.1"
+# Port to listen on
+port = 8080
+# Enable CORS for web applications
+cors_enabled = false
+# CORS allowed origins
+cors_allowed_origins = ["http://localhost:3000"]
+# Enable rate limiting
+rate_limiting_enabled = true
+# Rate limit requests per minute
+rate_limit_rpm = 60
+# Enable authentication
+auth_enabled = false
+# API key (if auth enabled)
+api_key = ""
+# Enable WebSocket endpoint for real-time updates
+websocket_enabled = true
+# WebSocket ping interval in seconds
+websocket_ping_interval_secs = 30
+# Maximum WebSocket message size in bytes
+websocket_max_message_size = 16777216  # 16MB
+
+[vram]
+# Enable VRAM monitoring
+enabled = true
+# Monitoring interval in seconds
+monitoring_interval_secs = 2
+# Low VRAM threshold (percentage)
+low_vram_threshold_percent = 80.0
+# Critical VRAM threshold (percentage)
+critical_vram_threshold_percent = 95.0
+# Enable automatic model eviction when VRAM is low
+auto_eviction_enabled = true
+# Eviction policy (lru, lfu, fifo, size_based, priority_based)
+eviction_policy = "lru"
+# Minimum free VRAM to maintain in GB
+min_free_vram_gb = 4.0
+
+[logging]
+# Log level (trace, debug, info, warn, error)
+level = "info"
+# Enable JSON logging format
+json_enabled = false
+# Log file path (empty for stdout)
+file_path = ""
+# Enable log file rotation
+file_rotation_enabled = true
+# Maximum log file size in MB
+max_file_size_mb = 100
+# Number of log files to keep
+max_files = 10
+# Enable structured logging
+structured_logging = false
+# Include thread IDs in logs
+include_thread_ids = true
+# Include timestamps in logs
+include_timestamps = true
+
+[paths]
+# Base data directory
+data_dir = "/var/lib/tensorforge"
+# Models directory
+models_dir = "/var/lib/tensorforge/models"
+# Cache directory
+cache_dir = "/var/lib/tensorforge/cache"
+# Logs directory
+logs_dir = "/var/lib/tensorforge/logs"
+# Config directory
+config_dir = "/etc/tensorforge"
+# Checkpoints directory
+checkpoints_dir = "/var/lib/tensorforge/checkpoints"
+# Temporary directory
+temp_dir = "/tmp/tensorforge"
+
+# Example model configurations
+# [[models]]
+# id = "mixtral-8x7b"
+# name = "Mixtral 8x7B"
+# path = "/var/lib/tensorforge/models/mixtral-8x7b"
+# format = "safetensors"
+# size_gb = 46.7
+# vram_estimate_gb = 24.0
+# architecture = "mixtral"
+# quantization = "fp16"
+# parameter_count = "8x7B"
+# context_length = 32768
+# compatible_backends = ["vllm", "llamacpp"]
+# tags = ["mixtral", "moe", "8x7b"]
+# priority = "high"
+
+# [[models]]
+# id = "llama-2-70b-q4_k_m"
+# name = "Llama 2 70B Q4_K_M"
+# path = "/var/lib/tensorforge/models/gguf/llama-2-70b.Q4_K_M.gguf"
+# format = "gguf"
+# size_gb = 39.5
+# vram_estimate_gb = 22.0
+# architecture = "llama"
+# quantization = "q4_k_m"
+# parameter_count = "70B"
+# context_length = 4096
+# compatible_backends = ["llamacpp"]
+# tags = ["llama", "70b", "quantized"]
+# priority = "normal"

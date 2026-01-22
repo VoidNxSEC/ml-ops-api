@@ -1,0 +1,161 @@
+[package]
+name = "tensorforge-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["kernelcore"]
+description = "High-performance ML inference orchestration engine for massive-scale pipelines"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kernelcore/tensorforge"
+homepage = "https://github.com/kernelcore/tensorforge"
+keywords = ["ml", "inference", "orchestration", "pipeline", "rust"]
+categories = ["science::machine-learning", "network-programming", "asynchronous"]
+publish = false
+
+[[bin]]
+name = "tensorforge"
+path = "src/main.rs"
+
+[lib]
+name = "tensorforge"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+prometheus = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+nvml-wrapper = { workspace = true, optional = true }
+sysinfo = { workspace = true }
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+once_cell = { workspace = true }
+arc-swap = { workspace = true }
+
+# Additional dependencies not in workspace
+tower = { version = "0.4", features = ["timeout", "load-shed", "limit"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"], optional = true }
+tower-layer = "0.3"
+tracing-appender = { version = "0.2", optional = true }
+tracing-bunyan-formatter = { version = "0.3", optional = true }
+rand = "0.8"
+rayon = "1.7"
+indicatif = { version = "0.17", optional = true } # Progress bars
+clap = { version = "4.4", features = ["derive", "env"], optional = true }
+config = { version = "0.13", optional = true }
+toml = { version = "0.8", optional = true }
+schemars = { version = "0.8", optional = true }
+validator = { version = "0.16", features = ["derive"], optional = true }
+bytes = "1.5"
+mime = "0.3"
+http = "1.0"
+hyper = { version = "0.14", features = ["server", "client", "http1", "http2", "tcp"], optional = true }
+hyper-tls = "0.5"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-pemfile = "1.0"
+native-tls = "0.2"
+openssl = "0.10"
+parking_lot = "0.12"
+backoff = "0.4"
+tempfile = "3.8"
+walkdir = "2.4"
+glob = "0.3"
+itertools = "0.12"
+lazy_static = "1.4"
+num_cpus = "1.16"
+signal-hook = "0.3"
+signal-hook-tokio = "0.3"
+ctrlc = "3.4"
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full", "test-util", "rt-multi-thread"] }
+tracing-test = "0.2"
+proptest = "1.4"
+tempfile = "3.8"
+assert_matches = "1.5"
+criterion = "0.5"
+mockall = "0.12"
+wiremock = "0.5"
+
+[features]
+default = ["api", "metrics", "vram-monitoring"]
+api = ["dep:axum", "dep:tower-http", "dep:hyper"]
+metrics = ["dep:prometheus", "dep:metrics", "dep:metrics-exporter-prometheus"]
+vram-monitoring = ["dep:nvml-wrapper"]
+gpu = ["dep:nvml-wrapper", "cuda"]
+cuda = []  # CUDA features if needed
+tracing = ["dep:tracing-subscriber", "dep:tracing-appender", "dep:tracing-bunyan-formatter"]
+cli = ["dep:clap", "dep:indicatif"]
+config-file = ["dep:config", "dep:toml", "dep:schemars"]
+validation = ["dep:validator"]
+
+orchestrator = []
+pipeline = []
+
+# Backend features
+backend-vllm = []  # vLLM backend support
+backend-llamacpp = []  # llama.cpp backend support
+backend-all = ["backend-vllm", "backend-llamacpp"]
+
+# Experimental features
+experimental-dspy = []  # DSPy integration (Python bridge)
+experimental-kubernetes = []  # Kubernetes operator
+experimental-grafana = []  # Grafana dashboard integration
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+codegen-units = 256
+rpath = false
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.bench]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "unwind"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.test]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+codegen-units = 256
+rpath = false

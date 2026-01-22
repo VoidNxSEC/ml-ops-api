@@ -6,7 +6,7 @@
 /// - vLLM (Docker container + HTTP API) - Future
 /// - TGI (Docker container + HTTP API) - Future
 
-pub mod llamacpp;
+
 
 use crate::models::BackendInfo;
 
@@ -48,3 +48,12 @@ impl BackendDriver {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::{mock, Matcher};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_list_backends_active_llamacpp

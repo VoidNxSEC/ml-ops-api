@@ -12,6 +12,8 @@ use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, TraceLayer},
 };
+use crate::models::{ApiResponse, LoadRequest, UnloadRequest, SwitchRequest};
+use crate::backends::BackendDriver;
 use tracing::{info, warn};
 
 mod api;
@@ -199,25 +201,20 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn list_backends_handler() -> impl IntoResponse {
-    // TODO: Implement backend detection
-    let backends = vec![
-        serde_json::json!({
-            "name": "ollama",
-            "status": "unknown",
-            "type": "systemd",
-            "host": "127.0.0.1",
-            "port": 11434,
-        }),
-        serde_json::json!({
-            "name": "llamacpp",
-            "status": "unknown",
-            "type": "systemd",
-            "host": "127.0.0.1",
-            "port": 8080,
-        }),
-    ];
-
-    Json(backends)
+    tokio::task::spawn_blocking(|| async {
+        match BackendDriver::list_backends().await {
+            Ok(backends) => Ok::<_, StatusCode>(Json(backends)),
+            Err(e) => {
+                warn!("Backend list error: {}", e);
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap_or_else(|_| {
+        Json(ApiResponse::error("Failed to list backends".to_string()))
+    })
 }
 
 #[derive(Deserialize)]
@@ -283,6 +280,7 @@ async fn trigger_scan_handler() -> impl IntoResponse {
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let vram_monitor = state.vram_monitor.read().await;
     let vram_state = vram_monitor.get_state();
+    let backends = BackendDriver::list_backends().await.unwrap_or_default();
 
     Json(serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -292,7 +290,7 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
             "free_gb": vram_state.free_gb,
             "utilization_percent": vram_state.utilization_percent,
         },
-        "backends": [],
+        "backends": backends,
         "loaded_models": [],
         "pending_queue": [],
     }))
@@ -306,40 +304,73 @@ async fn vram_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn load_model_handler(
-    State(_state): State<AppState>,
-    Json(_payload): Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    // TODO: Implement in Phase 2
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "Model loading not yet implemented"
-        })),
-    )
+    let model_path = match req.model_id {
+        Some(id) => {
+            match state.db.get_model_by_id(id).await {
+                Ok(Some(model)) => model.path,
+                Ok(None) => return Json(ApiResponse::error("Model not found".to_string())),
+                Err(e) => {
+                    warn!("DB error: {}", e);
+                    return Json(ApiResponse::error("Database error".to_string()));
+                }
+            }
+        }
+        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+    };
+
+    match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
+        Ok(()) => Json(ApiResponse::success("Model loaded successfully".to_string())),
+        Err(e) => {
+            warn!("Load failed for {} on {}: {}", model_path, req.backend, e);
+            Json(ApiResponse::error(format!("Load failed: {}", e)))
+        }
+    }
 }
 
 async fn unload_model_handler(
     State(_state): State<AppState>,
-    Json(_payload): Json<serde_json::Value>,
+    Json(req): Json<UnloadRequest>,
 ) -> impl IntoResponse {
-    // TODO: Implement in Phase 2
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "Model unloading not yet implemented"
-        })),
-    )
+    match BackendDriver::unload_model(&req.backend).await {
+        Ok(()) => Json(ApiResponse::success("Model unloaded successfully".to_string())),
+        Err(e) => {
+            warn!("Unload failed for {}: {}", req.backend, e);
+            Json(ApiResponse::error(format!("Unload failed: {}", e)))
+        }
+    }
 }
 
 async fn switch_model_handler(
-    State(_state): State<AppState>,
-    Json(_payload): Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Json(req): Json<SwitchRequest>,
 ) -> impl IntoResponse {
-    // TODO: Implement in Phase 2
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "Model switching not yet implemented"
-        })),
-    )
+    // Unload first, then load new
+    if let Err(e) = BackendDriver::unload_model(&req.backend).await {
+        warn!("Switch unload failed: {}", e);
+    }
+
+    let model_path = match req.model_id {
+        Some(id) => {
+            match state.db.get_model_by_id(id).await {
+                Ok(Some(model)) => model.path,
+                Ok(None) => return Json(ApiResponse::error("Model not found".to_string())),
+                Err(e) => {
+                    warn!("DB error: {}", e);
+                    return Json(ApiResponse::error("Database error".to_string()));
+                }
+            }
+        }
+        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+    };
+
+    match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
+        Ok(()) => Json(ApiResponse::success("Model switched successfully".to_string())),
+        Err(e) => {
+            warn!("Switch load failed for {} on {}: {}", model_path, req.backend, e);
+            Json(ApiResponse::error(format!("Switch failed: {}", e)))
+        }
+    }
 }
