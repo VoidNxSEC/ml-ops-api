@@ -5,6 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Built with Nix](https://img.shields.io/badge/Built_With-Nix-5277C3.svg?logo=nixos&logoColor=white)](https://nixos.org)
 [![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![CI](https://github.com/kernelcore/arch-ml-offload-api/actions/workflows/ci.yml/badge.svg)](https://github.com/kernelcore/arch-ml-offload-api/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kernelcore/arch-ml-offload-api/branch/main/graph/badge.svg)](https://codecov.io/gh/kernelcore/arch-ml-offload-api)
 
 ## Overview
 

@@ -1,10 +1,17 @@
 use crate::models::{GpuInfo, GpuProcess, VramState};
+use crate::VramMonitorTrait;
 use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 use tracing::{error, warn};
 
 /// VRAM monitor using NVIDIA Management Library
 pub struct VramMonitor {
     nvml: Nvml,
+}
+
+impl VramMonitorTrait for VramMonitor {
+    fn get_state(&self) -> VramState {
+        self.get_state()
+    }
 }
 
 impl VramMonitor {

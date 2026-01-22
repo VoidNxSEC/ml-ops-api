@@ -1,5 +1,22 @@
 name: CI
 
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the main branch
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      enable-tmate:
+        description: 'Enable tmate debug session'
+        required: false
+        type: boolean
+        default: false
+
 on:
   push:
     branches: [main, develop]
@@ -113,6 +130,57 @@ jobs:
       - name: Test devShell
         run: nix develop --command echo "DevShell OK"
 
+  # Integration Tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: rust-ci
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: api/target
+          key: ${{ runner.os }}-cargo-build-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run integration tests
+        working-directory: api
+        run: cargo test --test integration_tests --verbose --all-features
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: api/target/debug/deps/
+          retention-days: 7
+
+      - name: Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Integration Tests
+          path: 'api/target/debug/deps/integration_tests-*'
+          reporter: java-junit
+          fail-on-error: false
+
   # Security Audit
   security:
     name: Security Audit
@@ -161,6 +229,18 @@ jobs:
           files: api/lcov.info
           fail_ci_if_error: false
 
+      - name: Generate HTML coverage report
+        working-directory: api
+        run: |
+          genhtml lcov.info --output-directory htmlcov
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-report
+          path: api/htmlcov/
+          retention-days: 7
+
   # tmate Debug (on demand or failure)
   debug:
     name: Debug Session
@@ -176,3 +256,50 @@ jobs:
         with:
           limit-access-to-actor: true
           timeout-minutes: 30
+
+  # Visual Feedback Job
+  visual-feedback:
+    name: Visual Feedback
+    runs-on: ubuntu-latest
+    needs: [rust-ci, integration-tests, coverage]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate visual summary
+        run: |
+          echo "# CI Status Summary" > ci_summary.md
+          echo "" >> ci_summary.md
+          echo "## Test Results" >> ci_summary.md
+          echo "- Unit Tests: ${{ needs.rust-ci.result == 'success' && '✅ Passed' || '❌ Failed' }}" >> ci_summary.md
+          echo "- Integration Tests: ${{ needs.integration-tests.result == 'success' && '✅ Passed' || '❌ Failed' }}" >> ci_summary.md
+          echo "" >> ci_summary.md
+          echo "## Coverage" >> ci_summary.md
+          echo "- Coverage Report: ${{ needs.coverage.result == 'success' && '✅ Generated' || '❌ Failed' }}" >> ci_summary.md
+          echo "" >> ci_summary.md
+          echo "## Artifacts" >> ci_summary.md
+          echo "- [Binary Artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)" >> ci_summary.md
+          echo "- [Coverage Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)" >> ci_summary.md
+          echo "- [Test Results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)" >> ci_summary.md
+
+      - name: Upload visual summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-visual-summary
+          path: ci_summary.md
+          retention-days: 7
+
+      - name: Comment PR with visual feedback
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('ci_summary.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });

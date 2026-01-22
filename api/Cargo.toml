@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Database
-sqlx
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio", "macros"] }
 
 # HTTP client (for backend communication)
 reqwest = { version = "0.11", features = ["json"] }
@@ -47,6 +47,20 @@ thiserror = "1.0"
 
 # Process management
 sysinfo = "0.30"
+
+[dev-dependencies]
+# Testing framework enhancements
+tokio-test = "0.4"
+pretty_assertions = "1.4"
+# Integration testing
+axum-test = "15.2"
+# HTTP client for tests
+reqwest = { version = "0.11", features = ["json"] }
+# Mocking
+mockall = "0.12"
+tempfile = "3.8"
+# Async traits for mocking
+async-trait = "0.1"
 
 [profile.release]
 opt-level = 3
