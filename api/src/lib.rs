@@ -279,7 +279,7 @@ async fn vram_handler(State(state): State<AppState>) -> impl IntoResponse {
     let vram_monitor = state.vram_monitor.read().await;
     let vram_state = vram_monitor.get_state();
 
-    Json(vram_state)
+    Json(vram_state),
 }
 
 async fn load_model_handler(
