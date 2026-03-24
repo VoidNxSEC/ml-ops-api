@@ -1,0 +1,14 @@
+cerebro:
+  optimizer:
+    enabled: true
+    model: "claude-3-5-sonnet-20241022"
+    temperature: 0.7
+    num_suggestions: 5
+phantom:
+  cortex:
+    enabled: false
+    consensus_strategy: "majority_vote"
+spectre:
+  nats:
+    enabled: false
+    url: "nats://localhost:4222"

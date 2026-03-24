@@ -1,0 +1,56 @@
+# ML Offload API Infrastructure
+# Services: MLflow (experiment tracking), PostgreSQL
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: mloffload-postgres
+    environment:
+      POSTGRES_USER: mloffload
+      POSTGRES_PASSWORD: mloffload
+      POSTGRES_DB: mloffload
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U mloffload" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mloffload-network
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.2
+    container_name: mloffload-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      mlflow server
+        --backend-store-uri postgresql://mloffload:mloffload@postgres:5432/mloffload
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    environment:
+      - MLFLOW_TRACKING_URI=http://0.0.0.0:5000
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - mloffload-network
+
+networks:
+  mloffload-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:

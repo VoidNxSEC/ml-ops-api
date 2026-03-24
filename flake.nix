@@ -77,6 +77,23 @@
           doCheck = false;
         };
 
+        # Python MLOps environment
+        python = pkgs.python313;
+
+        mlopsEnv = python.withPackages (ps: with ps; [
+          mlflow
+          pyyaml
+          grpcio
+          # Optional heavy deps — comment out if not needed locally
+          # temporalio
+          # dspy
+          # anthropic
+          # openai
+          # tenacity
+          pytest
+          pytest-asyncio
+        ]);
+
       in
       {
         packages = {
@@ -90,32 +107,47 @@
           forge = flake-utils.lib.mkApp { drv = tensorForge; };
         };
 
-        devShells.default = pkgs.mkShell {
-          buildInputs =
-            commonBuildInputs
-            ++ (with pkgs; [
-              # Ferramentas de Dev
-              cargo-watch
-              cargo-edit
-              bacon
-              jq
+        devShells = {
+          default = pkgs.mkShell {
+            buildInputs =
+              commonBuildInputs
+              ++ (with pkgs; [
+                # Ferramentas de Dev
+                cargo-watch
+                cargo-edit
+                bacon
+                jq
 
-              # Utilitários de Sistema
-              pciutils # lspci
-              hwloc
-            ]);
+                # Utilitários de Sistema
+                pciutils # lspci
+                hwloc
+              ]);
 
-          nativeBuildInputs = commonNativeBuildInputs;
+            nativeBuildInputs = commonNativeBuildInputs;
 
-          # Variáveis de ambiente para desenvolvimento
-          ML_OFFLOAD_DB_PATH = "./dev.db";
-          RUST_LOG = "info";
+            # Variáveis de ambiente para desenvolvimento
+            ML_OFFLOAD_DB_PATH = "./dev.db";
+            RUST_LOG = "info";
 
-          shellHook = ''
-            echo "🔧 ML Offload Ecosystem Environment"
-            echo "   Components: API (axum) + TensorForge (engine)"
-            echo "   Rust: $(rustc --version)"
-          '';
+            shellHook = ''
+              echo "ML Offload Ecosystem Environment"
+              echo "   Components: API (axum) + TensorForge (engine)"
+              echo "   Rust: $(rustc --version)"
+            '';
+          };
+
+          # Shell Python MLOps — para desenvolvimento da camada mlops/
+          mlops = pkgs.mkShell {
+            buildInputs = [ mlopsEnv pkgs.python313 ];
+
+            shellHook = ''
+              echo "MLOps Python Environment"
+              echo "   Python: $(python3.13 --version)"
+              echo "   Pacote: python/mlops/"
+              echo "   Testes: cd python && python3.13 -m pytest tests/ -v"
+              export PYTHONPATH="$PWD/python:$PYTHONPATH"
+            '';
+          };
         };
       }
     );
