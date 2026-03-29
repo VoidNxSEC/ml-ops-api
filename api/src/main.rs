@@ -22,6 +22,7 @@ mod db;
 mod health;
 mod inference;
 mod models;
+mod nats;
 mod vram;
 mod websocket;
 
@@ -36,6 +37,7 @@ pub struct AppState {
     db: Arc<Database>,
     vram_monitor: Arc<RwLock<dyn VramMonitorTrait>>,
     config: Arc<Config>,
+    pub nats_publisher: Arc<nats::NatsPublisher>,
 }
 
 /// Configuration from environment variables
@@ -98,11 +100,17 @@ async fn main() -> anyhow::Result<()> {
     let vram_monitor = Arc::new(RwLock::new(VramMonitor::new()?));
     info!("VRAM monitor initialized");
 
+    // Initialize NATS publisher (non-fatal if unavailable)
+    let nats_url = std::env::var("NATS_URL")
+        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let nats_publisher = Arc::new(nats::NatsPublisher::connect(&nats_url).await);
+
     // Create application state
     let app_state = AppState {
         db,
         vram_monitor,
         config: config.clone(),
+        nats_publisher,
     };
 
     // Build router

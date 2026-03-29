@@ -18,7 +18,9 @@ use axum::{
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::time::Instant;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::backends::llamacpp::LlamaCppBackend;
 use crate::AppState;
@@ -222,9 +224,23 @@ pub async fn chat_completions_handler(
 }
 
 async fn non_streaming_response(
-    _state: AppState,
+    state: AppState,
     request: ChatCompletionRequest,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let request_id = Uuid::new_v4();
+    let start = Instant::now();
+    let model = request.model.clone();
+    let messages_count = request.messages.len();
+
+    // Publish inference.request.v1 (fire-and-forget)
+    {
+        let publisher = state.nats_publisher.clone();
+        let m = model.clone();
+        tokio::spawn(async move {
+            publisher.publish_inference_request(request_id, &m, messages_count).await;
+        });
+    }
+
     // Create llamacpp backend client
     let backend = match LlamaCppBackend::with_defaults() {
         Ok(b) => b,
@@ -254,7 +270,24 @@ async fn non_streaming_response(
             if status.is_success() {
                 // Parse and return the response
                 match serde_json::from_slice::<ChatCompletionResponse>(&body) {
-                    Ok(chat_response) => Ok(Json(chat_response)),
+                    Ok(chat_response) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let completion_tokens = chat_response.usage.completion_tokens;
+                        let publisher = state.nats_publisher.clone();
+                        let m = model.clone();
+                        tokio::spawn(async move {
+                            publisher
+                                .publish_inference_response(
+                                    request_id,
+                                    &m,
+                                    completion_tokens,
+                                    duration_ms,
+                                    "success",
+                                )
+                                .await;
+                        });
+                        Ok(Json(chat_response))
+                    }
                     Err(e) => {
                         warn!("Failed to parse llama-server response: {}", e);
                         Err((
