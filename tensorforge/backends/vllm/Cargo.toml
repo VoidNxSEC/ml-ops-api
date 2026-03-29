@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["kernelcore"]
 description = "vLLM backend implementation for TensorForge ML inference orchestration"
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 publish = false
 
