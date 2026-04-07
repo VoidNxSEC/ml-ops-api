@@ -37,6 +37,7 @@ hr()   { echo -e "${BLU}──────────────────�
 
 # ── Script references ──────────────────────────────────────────────────────────
 S_DEPS="$SCRIPT_DIR/install-deps.sh"
+S_SHELL="$SCRIPT_DIR/setup-shell.sh"
 S_BOOT="$SCRIPT_DIR/bootstrap.sh"
 S_PULL="$SCRIPT_DIR/model-pull.sh"
 S_SERV="$SCRIPT_DIR/server.sh"
@@ -90,6 +91,10 @@ ${BOLD}Commands:${RST}
 
   ${GRN}health${RST}  [--json] [--watch N]
           GPU stats, server health, quick latency benchmark.
+
+  ${GRN}shell${RST}   [--no-starship] [--dry-run]
+          Install zsh + starship + plugins + GPU/tensorforge aliases.
+          Run once per machine to get a productive terminal.
 
   ${GRN}status${RST}
           Quick overview: GPU, server, available models.
@@ -274,6 +279,7 @@ shift || true
 
 case "$CMD" in
   setup)    cmd_setup   "$@" ;;
+  shell)    require_script "$S_SHELL"; bash "$S_SHELL" "$@" ;;
   pull)     cmd_pull    "$@" ;;
   run)      cmd_run     "$@" ;;
   analyze)  cmd_analyze "$@" ;;
