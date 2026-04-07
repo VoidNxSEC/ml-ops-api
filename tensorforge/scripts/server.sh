@@ -131,7 +131,6 @@ cmd_start() {
     --ubatch-size   "$UBATCH_SIZE"
     --threads       "$MAIN_THREADS"
     --threads-batch "$THREADS_BATCH"
-    --log-format    json
   )
   [[ "$FLASH_ATTN"    == "true" ]] && ARGS+=(--flash-attn)
   [[ "$CONT_BATCHING" == "true" ]] && ARGS+=(--cont-batching)
