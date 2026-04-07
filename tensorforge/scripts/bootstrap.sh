@@ -215,13 +215,25 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
     2>&1 | tail -5
 
   log "Installing to $PREFIX..."
-  cmake --install "$BUILD_OUT" --strip > /dev/null 2>&1
+  cmake --install "$BUILD_OUT" --strip 2>&1 | grep -v "^--" || true
+
+  # cmake --install may not include llama-server in some versions.
+  # Find the binary in the build tree and copy manually if needed.
+  mkdir -p "$PREFIX/bin"
+  if [[ ! -x "$LLAMA_BIN" ]]; then
+    FOUND=$(find "$BUILD_OUT" -type f -name "llama-server" 2>/dev/null | head -1)
+    if [[ -n "$FOUND" ]]; then
+      cp "$FOUND" "$LLAMA_BIN"
+      chmod +x "$LLAMA_BIN"
+      ok "Binary copied manually: $FOUND → $LLAMA_BIN"
+    fi
+  fi
 
   ok "Build complete"
 fi
 
 # ── 7. Validate binary ────────────────────────────────────────────────────────
-[[ -x "$LLAMA_BIN" ]] || die "Binary not found after build: $LLAMA_BIN"
+[[ -x "$LLAMA_BIN" ]] || die "Binary not found after build: $LLAMA_BIN\n  Searched: $PREFIX/bin/ and $BUILD_DIR/build/"
 BIN_VER=$("$LLAMA_BIN" --version 2>&1 | head -1 || echo "unknown")
 ok "llama-server: $BIN_VER"
 
