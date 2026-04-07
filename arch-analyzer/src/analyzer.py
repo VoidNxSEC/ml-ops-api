@@ -1,0 +1,1 @@
+/home/kernelcore/master/arch-analyzer/src/analyzer.py
