@@ -79,7 +79,7 @@ class SimpleLLMProvider:
 
             client = openai.OpenAI(
                 api_key="not-needed",
-                base_url="http://localhost:8081/v1",
+                base_url="http://localhost:8080/v1",
             )
 
             response = client.chat.completions.create(
@@ -94,7 +94,7 @@ class SimpleLLMProvider:
         except Exception as e:
             raise RuntimeError(
                 f"Local llama.cpp call failed: {e}. "
-                f"Certifique-se que llama.cpp server está rodando em localhost:8081"
+                f"Certifique-se que llama.cpp server está rodando em localhost:8080"
             )
 
 

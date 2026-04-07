@@ -19,7 +19,7 @@
 
 {
   imports = [
-    ./manager.nix
+    ./.manager.nix
     ./registry
     ./backends
     # ./api is a separate flake project, not imported here
