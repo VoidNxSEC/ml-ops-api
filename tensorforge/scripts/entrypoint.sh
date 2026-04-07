@@ -38,6 +38,7 @@ hr()   { echo -e "${BLU}──────────────────�
 # ── Script references ──────────────────────────────────────────────────────────
 S_DEPS="$SCRIPT_DIR/install-deps.sh"
 S_SHELL="$SCRIPT_DIR/setup-shell.sh"
+S_NIX="$SCRIPT_DIR/bootstrap-nix.sh"
 S_BOOT="$SCRIPT_DIR/bootstrap.sh"
 S_PULL="$SCRIPT_DIR/model-pull.sh"
 S_SERV="$SCRIPT_DIR/server.sh"
@@ -280,6 +281,7 @@ shift || true
 case "$CMD" in
   setup)    cmd_setup   "$@" ;;
   shell)    require_script "$S_SHELL"; bash "$S_SHELL" "$@" ;;
+  nix)      require_script "$S_NIX";   bash "$S_NIX"   "$@" ;;
   pull)     cmd_pull    "$@" ;;
   run)      cmd_run     "$@" ;;
   analyze)  cmd_analyze "$@" ;;
