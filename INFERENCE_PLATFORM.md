@@ -41,11 +41,13 @@ The full "entrar, inferir, extrair, exportar, fechar" lifecycle in bash:
 
 | Script | Role |
 |--------|------|
+| `entrypoint.sh` | **Single entrypoint** — orchestrates all commands: `setup`, `run`, `analyze`, `server`, `health`, `status` |
+| `install-deps.sh` | Install ALL apt packages + Python venv for llama.cpp build and arch-analyzer |
 | `bootstrap.sh` | Build llama.cpp from source with CUDA, auto-detect GPU arch (sm_XX), write `env.sh` |
 | `server.sh` | start / stop / restart / status / logs / gpu — B200 defaults: `-ngl 999 --flash-attn --cont-batching` |
 | `model-pull.sh` | Download GGUF models from HuggingFace registry; supports resume, HF token |
 | `infer.sh` | Single-shot inference: prompt / file / stream / JSON mode |
-| `run.sh` | **Full pipeline**: auto-start server → infer → export → auto-stop |
+| `run.sh` | Full pipeline: auto-start server → infer → export → auto-stop |
 | `export.sh` | Convert JSON results to text / markdown / jsonl / csv |
 | `health.sh` | GPU + server status + latency benchmark; `--watch N` for live monitoring |
 | `Makefile` | Shortcuts: `make bootstrap`, `make run PROMPT="..."`, `make health-watch` |
@@ -53,17 +55,63 @@ The full "entrar, inferir, extrair, exportar, fechar" lifecycle in bash:
 ### Quick Start (NIM / bare Linux)
 
 ```bash
-# 1. Build llama.cpp with CUDA (once)
+# 1. Setup everything in one shot: deps + build + model
+./tensorforge/scripts/entrypoint.sh setup --model qwen2.5-coder-32b
+
+# 2. Full pipeline (auto-start → infer → display → auto-stop)
+./tensorforge/scripts/entrypoint.sh run \
+  --prompt "analyze this Rust codebase for security issues" \
+  --output result.json
+
+# 3. Export result to markdown
+./tensorforge/scripts/export.sh --input result.json --format markdown
+
+# 4. Run platform-wide code analysis (all ~/master/ projects)
+./tensorforge/scripts/entrypoint.sh analyze --platform
+```
+
+### Batch Inference — Fleet Pattern
+
+```bash
+# Prepare prompt files
+ls prompts/*.txt
+
+# Start → batch all prompts → results in results/ → stop
+./tensorforge/scripts/entrypoint.sh run \
+  --batch prompts/ \
+  --output-dir results/ \
+  --keep-alive       # leave server running between jobs
+
+# Export all to markdown
+./tensorforge/scripts/export.sh --dir results/ --format markdown --out-dir reports/
+
+# Teardown
+./tensorforge/scripts/entrypoint.sh server stop
+```
+
+### Manual step-by-step (full control)
+
+```bash
+# 1. Install system packages
+./tensorforge/scripts/install-deps.sh
+
+# 2. Build llama.cpp with CUDA
 ./tensorforge/scripts/bootstrap.sh
 
-# 2. Download model
+# 3. Download model
 ./tensorforge/scripts/model-pull.sh --model qwen2.5-coder-32b
 
-# 3. Full pipeline
-./tensorforge/scripts/run.sh --prompt "analyze this Rust codebase" --output result.json
+# 4. Start server
+./tensorforge/scripts/server.sh start
 
-# 4. Export result
+# 5. Single inference
+./tensorforge/scripts/infer.sh "explain this code" --output result.json
+
+# 6. Export
 ./tensorforge/scripts/export.sh --input result.json --format markdown
+
+# 7. Stop
+./tensorforge/scripts/server.sh stop
 ```
 
 ### Model Registry
@@ -76,6 +124,7 @@ The full "entrar, inferir, extrair, exportar, fechar" lifecycle in bash:
 | `llama-3.3-70b` | 75GB | Best instruction following |
 | `deepseek-r1-14b` | 16GB | Reasoning, fits 24GB |
 | `deepseek-r1-70b` | 75GB | Strong reasoning, B200 |
+| `mistral-24b` | 26GB | Balanced |
 
 ---
 
@@ -95,16 +144,20 @@ Integrated into `ml-ops-api`, using the tensorforge llama.cpp backend as LLM.
 
 ### Platform Command
 
-Analyzes **every project** under `~/master/` in one run:
-
 ```bash
-# Full platform analysis — outputs PLATFORM-REPORT.md
-make -C arch-analyzer platform
+# Full platform analysis via entrypoint
+./tensorforge/scripts/entrypoint.sh analyze --platform
 
 # With specific model
-make -C arch-analyzer platform MODEL=llama-3.3-70b
+./tensorforge/scripts/entrypoint.sh analyze --platform --model llama-3.3-70b
 
 # Single project
+./tensorforge/scripts/entrypoint.sh analyze \
+  --project ~/master/neoland \
+  --template rust
+
+# Via make (arch-analyzer/Makefile)
+make -C arch-analyzer platform MODEL=llama-3.3-70b
 make -C arch-analyzer analyze-project TARGET=~/master/neoland TEMPLATE=rust
 ```
 
@@ -133,7 +186,7 @@ services.tensorforge.b200Optimized = {
 
 Key specs:
 - **VRAM**: 192GB HBM3e
-- **Context**: up to 131k tokens (vLLM), 32768 (llama.cpp)
+- **Context**: up to 131k tokens (vLLM), 65536 (llama.cpp on B200)
 - **Tensor parallelism**: 4 (B200 4-die architecture)
 - **Quantization**: FP8 (2x throughput)
 
@@ -165,9 +218,14 @@ Environment variables:
 | `LLAMACPP_URL` | `http://127.0.0.1:8080` | llama.cpp server endpoint |
 | `LLM_PARALLEL` | `8` | Concurrent inference slots |
 | `LLM_TIMEOUT` | `180` | Request timeout (seconds) |
-| `TF_PREFIX` | `/opt/tensorforge/llamacpp` | Install prefix |
-| `TF_MODELS` | `/var/lib/tensorforge/models/gguf` | GGUF model directory |
+| `TF_PREFIX` | `~/.tensorforge/llamacpp` (non-root) or `/opt/tensorforge/llamacpp` (root) | Install prefix |
+| `TF_MODELS` | `$TF_PREFIX/models/gguf` | GGUF model directory |
 | `HF_TOKEN` | — | HuggingFace token (private models) |
+| `MLOCK` | `false` | Lock model in RAM (set `true` on bare-metal B200) |
+| `NO_MMAP` | `false` | Disable mmap (set `true` on bare-metal B200) |
+
+> **NIM container note**: `MLOCK` and `NO_MMAP` default to `false` because containers
+> typically lack `CAP_IPC_LOCK`. Enable manually on bare-metal nodes for peak performance.
 
 ---
 

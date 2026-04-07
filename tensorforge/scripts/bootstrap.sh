@@ -14,8 +14,15 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PREFIX="${PREFIX:-/opt/tensorforge/llamacpp}"
-MODELS_DIR="${MODELS_DIR:-/var/lib/tensorforge/models/gguf}"
+# Default prefix: system-wide if root, user-local otherwise (works in NIM containers)
+if [[ -z "${PREFIX:-}" ]]; then
+  if [[ "$(id -u)" == "0" ]]; then
+    PREFIX="/opt/tensorforge/llamacpp"
+  else
+    PREFIX="$HOME/.tensorforge/llamacpp"
+  fi
+fi
+MODELS_DIR="${MODELS_DIR:-${PREFIX}/models/gguf}"
 BUILD_DIR="${BUILD_DIR:-/tmp/llama-cpp-src}"
 REPO="https://github.com/ggerganov/llama.cpp.git"
 TAG="${LLAMACPP_TAG:-}"          # empty = latest main
@@ -97,14 +104,18 @@ ok "Compute: sm_${CUDA_ARCH}"
 # ── 2. System deps ────────────────────────────────────────────────────────────
 if [[ "$SKIP_DEPS" == "false" ]]; then
   log "Installing build dependencies..."
+  # Use sudo if not root (NIM containers, unprivileged users)
+  SUDO=""
+  [[ "$(id -u)" != "0" ]] && command -v sudo &>/dev/null && SUDO="sudo"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq 2>/dev/null
-  apt-get install -y --no-install-recommends \
+  $SUDO apt-get update -qq 2>/dev/null || warn "apt-get update failed — skipping (check permissions or use --skip-deps)"
+  $SUDO apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build git curl wget \
     libcurl4-openssl-dev libopenblas-dev \
     python3 python3-pip jq bc \
-    ca-certificates 2>/dev/null
-  ok "Build deps installed"
+    ca-certificates 2>/dev/null \
+    || warn "Some deps may be missing — build might still succeed if already installed"
+  ok "Build deps step done"
 fi
 
 # ── 3. Verify CUDA toolkit ────────────────────────────────────────────────────
@@ -158,7 +169,7 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
     -DLLAMA_CURL=ON
     -DBUILD_SHARED_LIBS=OFF
     -DLLAMA_BUILD_TESTS=OFF
-    -DLLAMA_BUILD_EXAMPLES=OFF
+    # NOTE: examples must stay ON — llama-server lives in examples/server/
   )
 
   if [[ "$HAS_CUDA" == "true" ]]; then

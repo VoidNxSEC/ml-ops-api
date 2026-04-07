@@ -15,11 +15,12 @@
 set -euo pipefail
 
 # ── Source env if available ───────────────────────────────────────────────────
-ENV_FILE="${TF_PREFIX:-/opt/tensorforge/llamacpp}/env.sh"
+_DEFAULT_PREFIX="$([[ "$(id -u)" == "0" ]] && echo "/opt/tensorforge/llamacpp" || echo "$HOME/.tensorforge/llamacpp")"
+ENV_FILE="${TF_PREFIX:-$_DEFAULT_PREFIX}/env.sh"
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 # ── Defaults (can be overridden via env or args) ──────────────────────────────
-PREFIX="${TF_PREFIX:-/opt/tensorforge/llamacpp}"
+PREFIX="${TF_PREFIX:-$_DEFAULT_PREFIX}"
 LLAMA_BIN="${TF_BIN:-$PREFIX/bin/llama-server}"
 MODELS_DIR="${TF_MODELS:-/var/lib/tensorforge/models/gguf}"
 PID_FILE="${TF_PID:-$PREFIX/run/server.pid}"
@@ -35,8 +36,10 @@ BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
 FLASH_ATTN="${FLASH_ATTN:-true}"
 CONT_BATCHING="${CONT_BATCHING:-true}"
-MLOCK="${MLOCK:-true}"
-NO_MMAP="${NO_MMAP:-true}"
+# mlock/no-mmap: good on bare metal B200, but require CAP_IPC_LOCK in containers
+# Set MLOCK=true / NO_MMAP=true manually on bare-metal NIM nodes
+MLOCK="${MLOCK:-false}"
+NO_MMAP="${NO_MMAP:-false}"
 THREADS_BATCH="${THREADS_BATCH:-$(nproc)}"
 MAIN_THREADS="${MAIN_THREADS:-4}"
 
