@@ -31,6 +31,7 @@ JOBS="${JOBS:-$(nproc)}"
 SKIP_DEPS=false
 SKIP_BUILD=false
 FORCE_REBUILD=false
+CUDA_ARCH_OVERRIDE=""   # --cuda-arch 89 bypasses nvidia-smi detection
 
 # ── Output ────────────────────────────────────────────────────────────────────
 RED='\033[1;31m'; GRN='\033[1;32m'; YLW='\033[1;33m'; BLU='\033[1;34m'; RST='\033[0m'
@@ -47,9 +48,10 @@ while [[ $# -gt 0 ]]; do
     --models-dir)   MODELS_DIR="$2";     shift 2 ;;
     --tag)          TAG="$2";            shift 2 ;;
     --jobs)         JOBS="$2";           shift 2 ;;
-    --skip-deps)    SKIP_DEPS=true;      shift   ;;
-    --skip-build)   SKIP_BUILD=true;     shift   ;;
-    --force-rebuild) FORCE_REBUILD=true; shift   ;;
+    --skip-deps)    SKIP_DEPS=true;               shift   ;;
+    --skip-build)   SKIP_BUILD=true;              shift   ;;
+    --force-rebuild) FORCE_REBUILD=true;          shift   ;;
+    --cuda-arch)    CUDA_ARCH_OVERRIDE="$2";      shift 2 ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo "  --prefix PATH       Install prefix (default: $PREFIX)"
@@ -59,6 +61,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --skip-deps         Skip apt install"
       echo "  --skip-build        Skip cmake build (use existing binary)"
       echo "  --force-rebuild     Force clean rebuild"
+      echo "  --cuda-arch ARCH    Override GPU arch (e.g. 89 for L40S, 90 for H100, 100 for B200)"
+      echo "                      Use when nvidia-smi fails (driver/library mismatch after toolkit install)"
       exit 0 ;;
     *) die "Unknown flag: $1" ;;
   esac
@@ -75,19 +79,31 @@ echo ""
 
 # ── 1. Detect NVIDIA GPU ──────────────────────────────────────────────────────
 log "Detecting GPU..."
-command -v nvidia-smi &>/dev/null || die "nvidia-smi not found — NVIDIA driver required"
 
-GPU_NAME=$(nvidia-smi --query-gpu=name         --format=csv,noheader | head -1 | xargs)
-GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1 | xargs)
-GPU_DRIV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | xargs)
-GPU_CUDA=$(nvidia-smi | awk '/CUDA Version/{print $NF}')
+if [[ -n "$CUDA_ARCH_OVERRIDE" ]]; then
+  # Manual override — skip nvidia-smi (use when driver/library version mismatch)
+  CUDA_ARCH="$CUDA_ARCH_OVERRIDE"
+  warn "GPU detection skipped (--cuda-arch override)"
+  ok "Compute: sm_${CUDA_ARCH} (manual)"
+  HAS_CUDA=true
+else
+  command -v nvidia-smi &>/dev/null || die "nvidia-smi not found — NVIDIA driver required"
 
-ok "GPU    : $GPU_NAME"
-ok "VRAM   : $GPU_VRAM"
-ok "Driver : $GPU_DRIV | CUDA cap: $GPU_CUDA"
+  GPU_NAME=$(nvidia-smi --query-gpu=name           --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "unknown")
+  GPU_VRAM=$(nvidia-smi --query-gpu=memory.total   --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "unknown")
+  GPU_DRIV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "unknown")
+  GPU_CUDA=$(nvidia-smi 2>/dev/null | awk '/CUDA Version/{print $NF}' || echo "unknown")
 
-# Detect compute capability
-CUDA_ARCH=$(python3 -c "
+  if [[ "$GPU_NAME" == "unknown" ]]; then
+    die "nvidia-smi returned no data — driver/library version mismatch?\n  Fix: sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm\n  Or bypass: $0 --cuda-arch 89  (L40S=89, H100=90, B200=100)"
+  fi
+
+  ok "GPU    : $GPU_NAME"
+  ok "VRAM   : $GPU_VRAM"
+  ok "Driver : $GPU_DRIV | CUDA cap: $GPU_CUDA"
+
+  # Detect compute capability
+  CUDA_ARCH=$(python3 -c "
 import subprocess, sys
 try:
     out = subprocess.check_output(
@@ -99,7 +115,8 @@ except:
     print('90')
 " 2>/dev/null || echo "90")
 
-ok "Compute: sm_${CUDA_ARCH}"
+  ok "Compute: sm_${CUDA_ARCH}"
+fi
 
 # ── 2. System deps ────────────────────────────────────────────────────────────
 if [[ "$SKIP_DEPS" == "false" ]]; then
@@ -128,7 +145,8 @@ if [[ -n "$NVCC_PATH" ]]; then
   export PATH="$(dirname "$NVCC_PATH"):$PATH"
   NVCC_VER=$(nvcc --version 2>&1 | grep -oP 'release \K[\d.]+' || echo "?")
   ok "nvcc: $NVCC_PATH (v$NVCC_VER)"
-  HAS_CUDA=true
+  # Only set HAS_CUDA if not already set by --cuda-arch override
+  [[ -z "${HAS_CUDA:-}" ]] && HAS_CUDA=true
 else
   warn "nvcc not found — building CPU-only (no CUDA acceleration)"
   HAS_CUDA=false
