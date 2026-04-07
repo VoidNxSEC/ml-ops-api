@@ -2,7 +2,7 @@
 target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Cargo.lock intentionally committed — this is a binary application, not a library
 
 # Nix
 result
