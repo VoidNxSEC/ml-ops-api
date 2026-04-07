@@ -106,38 +106,41 @@ cmd_quick() {
   hr
   echo ""
 
-  local pkgs="nixpkgs#llama-cpp nixpkgs#jq nixpkgs#curl"
+  NIX_FLAGS="--extra-experimental-features nix-command flakes"
 
-  # Add CUDA-capable llama.cpp if GPU detected
   if has_gpu; then
     ARCH=$(detect_gpu_arch)
-    ok "GPU detected (sm_${ARCH}) — loading CUDA-enabled llama.cpp"
-    # nixpkgs llama-cpp has CUDA support when cudaSupport=true
-    exec nix shell \
-      --extra-experimental-features "nix-command flakes" \
-      --override-input nixpkgs "github:NixOS/nixpkgs/nixos-unstable" \
-      nixpkgs#llama-cpp \
-      nixpkgs#jq \
-      nixpkgs#curl \
-      --command zsh -c '
-        echo ""
-        echo "  tensorforge quick shell"
-        echo "  llama-server: $(llama-server --version 2>&1 | head -1)"
-        echo ""
-        echo "  Start server:  llama-server --model /path/to/model.gguf --port 8080 -ngl 999"
-        echo "  Or use scripts: ./tensorforge/scripts/server.sh start"
-        echo ""
-        exec ${SHELL:-bash}
-      '
+    ok "GPU detected (sm_${ARCH})"
+
+    # IMPORTANT: nixpkgs#llama-cpp does NOT include CUDA by default.
+    # cudaSupport must be set at nixpkgs import time, not per-package.
+    # We use the flake's .#llama-cpp-cuda output which sets cudaSupport=true.
+    if [[ -f "$ML_OPS_ROOT/flake.nix" ]]; then
+      log "Using flake .#llama-cpp-cuda (CUDA-enabled, first run builds ~10 min)..."
+      warn "First run compiles llama.cpp with CUDA from source via Nix — grab a coffee."
+      exec nix shell $NIX_FLAGS \
+        "$ML_OPS_ROOT#llama-cpp-cuda" \
+        "nixpkgs#jq" "nixpkgs#curl" \
+        --command ${SHELL:-bash} -c '
+          echo ""
+          echo "  tensorforge — llama.cpp CUDA shell (via Nix)"
+          echo "  $(llama-server --version 2>&1 | head -1)"
+          echo ""
+          echo "  llama-server --model /path/to/model.gguf --port 8080 -ngl 999 --flash-attn"
+          echo ""
+          exec '"${SHELL:-bash}"
+    else
+      warn "flake.nix not found — falling back to nixpkgs#llama-cpp (CPU only)"
+      warn "For CUDA support clone the repo first: git clone ... ml-ops-api"
+      exec nix shell $NIX_FLAGS nixpkgs#llama-cpp nixpkgs#jq nixpkgs#curl \
+        --command ${SHELL:-bash}
+    fi
   else
-    warn "No GPU detected — loading CPU-only llama.cpp"
-    exec nix shell \
-      --extra-experimental-features "nix-command flakes" \
-      nixpkgs#llama-cpp nixpkgs#jq nixpkgs#curl \
+    warn "No GPU detected — CPU-only llama.cpp"
+    exec nix shell $NIX_FLAGS nixpkgs#llama-cpp nixpkgs#jq nixpkgs#curl \
       --command ${SHELL:-bash} -c '
         echo "  llama-server (CPU): $(llama-server --version 2>&1 | head -1)"
-        exec ${SHELL:-bash}
-      '
+        exec '"${SHELL:-bash}"
   fi
 }
 

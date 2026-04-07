@@ -1,151 +1,146 @@
 {
-  description = "ML Offload Ecosystem - API & TensorForge Orchestrator";
+  description = "tensorforge — GPU inference pipeline for the voidnxlabs platform";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url     = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-utils.url  = "github:numtide/flake-utils";
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      rust-overlay,
-      flake-utils,
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
+        # ── Standard pkgs ──────────────────────────────────────────────────────
         pkgs = import nixpkgs {
-          inherit system overlays;
+          inherit system;
+          overlays = [ (import rust-overlay) ];
           config.allowUnfree = true;
         };
 
+        # ── CUDA-enabled pkgs (x86_64-linux only) ──────────────────────────────
+        # cudaSupport must be set at import time — it cannot be overridden per-package
+        cudaPkgs = if system == "x86_64-linux" then
+          import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+            config = {
+              allowUnfree   = true;
+              cudaSupport   = true;
+            };
+          }
+        else pkgs;
+
+        # ── Rust toolchain ─────────────────────────────────────────────────────
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [
-            "rust-src"
-            "rust-analyzer"
-          ];
+          extensions = [ "rust-src" "rust-analyzer" ];
         };
 
-        commonNativeBuildInputs = with pkgs; [
-          pkg-config
-          rustToolchain
-        ];
+        commonNativeBuildInputs = with pkgs; [ pkg-config rustToolchain ];
 
-        commonBuildInputs =
-          with pkgs;
-          [
-            openssl
-            sqlite
-            zlib
-          ]
-          ++ pkgs.lib.optionals (system == "x86_64-linux") [
-            pkgs.cudaPackages.cuda_nvcc
-            pkgs.cudaPackages.cudatoolkit
-          ];
+        commonBuildInputs = with pkgs; [ openssl sqlite zlib ]
+          ++ pkgs.lib.optionals (system == "x86_64-linux") (with pkgs.cudaPackages; [
+            cuda_nvcc
+            cudatoolkit
+          ]);
 
-        # Pacote 1: API Server (Leve)
+        # ── Rust packages ──────────────────────────────────────────────────────
         mlOffloadApi = pkgs.rustPlatform.buildRustPackage {
-          pname = "ml-offload-api";
+          pname   = "ml-offload-api";
           version = "0.1.0";
-          src = ./api;
+          src     = ./api;
           cargoLock.lockFile = ./api/Cargo.lock;
-
-          nativeBuildInputs = commonNativeBuildInputs;
-          buildInputs = commonBuildInputs;
-
-          # NVML wrapper requer libnvidia-ml.so em runtime, geralmente provido pelo driver do host
-          # NixOS requer configuração especial via hardware.opengl
+          nativeBuildInputs  = commonNativeBuildInputs;
+          buildInputs        = commonBuildInputs;
         };
 
-        # Pacote 2: TensorForge (Engine)
         tensorForge = pkgs.rustPlatform.buildRustPackage {
-          pname = "tensorforge";
+          pname   = "tensorforge";
           version = "0.1.0";
-          src = ./tensorforge;
-
-          # TensorForge usa workspace, lockfile na raiz do subprojeto
+          src     = ./tensorforge;
           cargoLock.lockFile = ./tensorforge/Cargo.lock;
-
-          nativeBuildInputs = commonNativeBuildInputs;
-          buildInputs = commonBuildInputs;
-
-          # Ignorar testes que requerem GPU real durante o build
-          doCheck = false;
+          nativeBuildInputs  = commonNativeBuildInputs;
+          buildInputs        = commonBuildInputs;
+          doCheck = false;  # GPU tests require real hardware
         };
 
-        # Python MLOps environment
-        python = pkgs.python313;
-
-        mlopsEnv = python.withPackages (ps: with ps; [
-          mlflow
-          pyyaml
-          grpcio
-          # Optional heavy deps — comment out if not needed locally
-          # temporalio
-          # dspy
-          # anthropic
-          # openai
-          # tenacity
-          pytest
-          pytest-asyncio
+        # ── Python env (arch-analyzer) ─────────────────────────────────────────
+        pythonEnv = pkgs.python313.withPackages (ps: with ps; [
+          aiohttp aiofiles pydantic rich typer httpx pyyaml psutil
+          pytest pytest-asyncio
         ]);
 
-      in
-      {
+      in {
+        # ── Packages ───────────────────────────────────────────────────────────
         packages = {
-          default = mlOffloadApi;
-          api = mlOffloadApi;
-          forge = tensorForge;
+          default      = mlOffloadApi;
+          api          = mlOffloadApi;
+          forge        = tensorForge;
+          python       = pythonEnv;
+
+          # llama.cpp with CUDA (x86_64-linux only)
+          # Build time is significant (~10 min) — uses CUDA pkgs overlay
+          llama-cpp-cuda = cudaPkgs.llama-cpp;
         };
 
+        # ── Apps ───────────────────────────────────────────────────────────────
         apps = {
           default = flake-utils.lib.mkApp { drv = mlOffloadApi; };
-          forge = flake-utils.lib.mkApp { drv = tensorForge; };
+          forge   = flake-utils.lib.mkApp { drv = tensorForge; };
+
+          # Quick llama-server with CUDA
+          llama-server = flake-utils.lib.mkApp {
+            drv     = cudaPkgs.llama-cpp;
+            exePath = "/bin/llama-server";
+          };
         };
 
+        # ── Dev shells ─────────────────────────────────────────────────────────
         devShells = {
+          # Main dev shell: Rust + CUDA headers
           default = pkgs.mkShell {
-            buildInputs =
-              commonBuildInputs
-              ++ (with pkgs; [
-                # Ferramentas de Dev
-                cargo-watch
-                cargo-edit
-                bacon
-                jq
-
-                # Utilitários de Sistema
-                pciutils # lspci
-                hwloc
-              ]);
-
+            buildInputs = commonBuildInputs ++ (with pkgs; [
+              cargo-watch cargo-edit bacon jq pciutils hwloc
+            ]);
             nativeBuildInputs = commonNativeBuildInputs;
-
-            # Variáveis de ambiente para desenvolvimento
             ML_OFFLOAD_DB_PATH = "./dev.db";
-            RUST_LOG = "info";
-
+            RUST_LOG           = "info";
             shellHook = ''
-              echo "ML Offload Ecosystem Environment"
-              echo "   Components: API (axum) + TensorForge (engine)"
-              echo "   Rust: $(rustc --version)"
+              echo ""
+              echo "  tensorforge dev shell"
+              echo "  rust:   $(rustc --version)"
+              echo "  python: $(python3 --version)"
+              echo ""
             '';
           };
 
-          # Shell Python MLOps — para desenvolvimento da camada mlops/
-          mlops = pkgs.mkShell {
-            buildInputs = [ mlopsEnv pkgs.python313 ];
-
+          # Python / arch-analyzer shell
+          python = pkgs.mkShell {
+            buildInputs = [ pythonEnv pkgs.python313 ];
             shellHook = ''
-              echo "MLOps Python Environment"
-              echo "   Python: $(python3.13 --version)"
-              echo "   Pacote: python/mlops/"
-              echo "   Testes: cd python && python3.13 -m pytest tests/ -v"
-              export PYTHONPATH="$PWD/python:$PYTHONPATH"
+              echo "  arch-analyzer Python shell"
+              echo "  python: $(python3 --version)"
+              export PYTHONPATH="$PWD/arch-analyzer:$PYTHONPATH"
+            '';
+          };
+
+          # Full CUDA shell: Rust + llama.cpp + CUDA tools
+          # Note: first build downloads/compiles llama.cpp with CUDA (~10 min)
+          cuda = cudaPkgs.mkShell {
+            buildInputs = [
+              cudaPkgs.llama-cpp
+              cudaPkgs.cudaPackages.cuda_nvcc
+              cudaPkgs.cudaPackages.cudatoolkit
+              pkgs.jq pkgs.curl
+              rustToolchain
+            ];
+            shellHook = ''
+              echo ""
+              echo "  tensorforge CUDA shell"
+              echo "  llama-server: $(llama-server --version 2>&1 | head -1)"
+              echo "  nvcc:         $(nvcc --version 2>&1 | grep release)"
+              echo ""
+              echo "  Start server:  llama-server --model /path/to/model.gguf -ngl 999 --flash-attn"
+              echo ""
             '';
           };
         };
