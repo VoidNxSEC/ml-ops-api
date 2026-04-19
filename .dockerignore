@@ -1,0 +1,12 @@
+api/target/
+tensorforge/target/
+.git/
+*.nix
+flake.lock
+*.md
+scripts/
+config/
+python/
+arch-analyzer/
+backends/
+registry/
