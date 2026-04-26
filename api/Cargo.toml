@@ -50,6 +50,10 @@ async-nats = "0.38"
 
 # Process management
 sysinfo = "0.32"
+async-trait = "0.1"
+tempfile = "3.8"
+metrics = "0.24.3"
+metrics-exporter-prometheus = "0.18.1"
 
 [dev-dependencies]
 tokio-test        = "0.4"
@@ -59,6 +63,7 @@ reqwest           = { version = "0.12", features = ["json"] }
 mockall           = "0.13"
 tempfile          = "3.8"
 async-trait       = "0.1"
+mockito = "1.7.2"
 
 [profile.release]
 opt-level      = 3

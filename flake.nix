@@ -99,7 +99,7 @@
           # Main dev shell: Rust + CUDA headers
           default = pkgs.mkShell {
             buildInputs = commonBuildInputs ++ (with pkgs; [
-              cargo-watch cargo-edit bacon jq pciutils hwloc
+              cargo-watch cargo-edit bacon jq pciutils hwloc just
             ]);
             nativeBuildInputs = commonNativeBuildInputs;
             ML_OFFLOAD_DB_PATH = "./dev.db";

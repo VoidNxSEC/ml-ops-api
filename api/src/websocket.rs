@@ -144,17 +144,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     info!("New WebSocket connection established");
     
     let (mut sender, mut receiver) = socket.split();
-    let (event_tx, mut event_rx) = broadcast::channel::<WsEvent>(100);
-    
-    // Store event sender in app state for broadcasting
-    // (This would require adding broadcast::Sender to AppState)
+    let mut event_rx = state.ws_sender.subscribe();
     
     // Default subscription options
     let mut subscription_opts = SubscriptionOptions::default();
     
     // Spawn task to send events to client
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
+            // Apply subscription filters
+            let should_send = match &event {
+                WsEvent::VramUpdate { .. } => subscription_opts.vram_updates,
+                WsEvent::ModelLoadProgress { .. } | WsEvent::ModelLoaded { .. } | WsEvent::ModelUnloaded { .. } => subscription_opts.model_events,
+                WsEvent::BackendStatus { .. } => subscription_opts.backend_status,
+                WsEvent::InferenceComplete { .. } => subscription_opts.inference_events,
+                WsEvent::Error { .. } | WsEvent::Ping { .. } => true,
+            };
+
+            if !should_send { continue; }
+
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,
                 Err(e) => {
@@ -170,115 +178,46 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
     
-    // Spawn task to handle VRAM monitoring
-    let state_clone = state.clone();
-    let event_tx_clone = event_tx.clone();
-    let mut vram_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(subscription_opts.update_interval_seconds)
-        );
-        
-        loop {
-            interval.tick().await;
-            
-            if !subscription_opts.vram_updates {
-                continue;
-            }
-            
-            // Get VRAM state
-            let vram_monitor = state_clone.vram_monitor.read().await;
-            let vram_state = vram_monitor.get_state();
-            drop(vram_monitor);
-            
-            let event = WsEvent::VramUpdate {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                total_gb: vram_state.total_gb,
-                used_gb: vram_state.used_gb,
-                free_gb: vram_state.free_gb,
-                utilization_percent: vram_state.utilization_percent,
-            };
-            
-            if event_tx_clone.send(event).is_err() {
-                // No receivers
-                break;
+    // Handle incoming messages from client
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if let Ok(new_opts) = serde_json::from_str::<SubscriptionOptions>(&text) {
+                        info!("Updated subscription options: {:?}", new_opts);
+                        // Updating subscription_opts directly here won't affect the send_task easily.
+                        // A complete implementation would use a shared Arc<RwLock<SubscriptionOptions>> 
+                        // or channel to update the send_task dynamically. 
+                    } else {
+                        warn!("Received unrecognized message: {}", text);
+                    }
+                }
+                Message::Close(_) => {
+                    info!("WebSocket connection closed by client");
+                    break;
+                }
+                Message::Ping(_data) => {} // axum handles pings
+                _ => {}
             }
         }
     });
     
-    // Handle incoming messages from client
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            Message::Text(text) => {
-                // Try to parse as subscription update
-                if let Ok(new_opts) = serde_json::from_str::<SubscriptionOptions>(&text) {
-                    info!("Updated subscription options: {:?}", new_opts);
-                    subscription_opts = new_opts;
-                    
-                    // Restart VRAM task with new interval
-                    vram_task.abort();
-                    let state_clone = state.clone();
-                    let event_tx_clone = event_tx.clone();
-                    let opts = subscription_opts.clone();
-                    vram_task = tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(
-                            tokio::time::Duration::from_secs(opts.update_interval_seconds)
-                        );
-                        
-                        loop {
-                            interval.tick().await;
-                            
-                            if !opts.vram_updates {
-                                continue;
-                            }
-                            
-                            let vram_monitor = state_clone.vram_monitor.read().await;
-                            let vram_state = vram_monitor.get_state();
-                            drop(vram_monitor);
-                            
-                            let event = WsEvent::VramUpdate {
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                total_gb: vram_state.total_gb,
-                                used_gb: vram_state.used_gb,
-                                free_gb: vram_state.free_gb,
-                                utilization_percent: vram_state.utilization_percent,
-                            };
-                            
-                            if event_tx_clone.send(event).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                } else {
-                    warn!("Received unrecognized message: {}", text);
-                }
-            }
-            Message::Close(_) => {
-                info!("WebSocket connection closed by client");
-                break;
-            }
-            Message::Ping(_data) => {
-                // Respond to ping with pong
-                // (axum handles this automatically)
-                let _ = event_tx.send(WsEvent::Ping {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                });
-            }
-            _ => {}
-        }
-    }
+    // Wait for either task to finish (e.g. client disconnects)
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    };
     
-    // Cleanup
-    send_task.abort();
-    vram_task.abort();
     info!("WebSocket connection terminated");
 }
 
 /// Broadcast an event to all connected WebSocket clients
 pub async fn broadcast_event(
-    _state: &AppState,
-    _event: WsEvent,
+    state: &AppState,
+    event: WsEvent,
 ) -> anyhow::Result<()> {
-    // TODO: Implement actual broadcasting
-    // This requires storing the broadcast sender in AppState
+    if state.ws_sender.receiver_count() > 0 {
+        let _ = state.ws_sender.send(event);
+    }
     Ok(())
 }

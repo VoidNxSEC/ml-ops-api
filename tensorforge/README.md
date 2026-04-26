@@ -353,7 +353,7 @@ cargo fmt --check
 
 ### Phase 2: Advanced Features (In Progress)
 - [ ] DSPy integration layer
-- [ ] Advanced routing algorithms
+- [x] Advanced routing algorithms
 - [ ] Cost optimization engine
 - [ ] Real-time dashboard
 - [ ] B200-specific optimizations

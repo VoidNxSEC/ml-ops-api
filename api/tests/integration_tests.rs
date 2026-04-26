@@ -9,7 +9,7 @@ use std::sync::Arc;
 async fn setup_test_server() -> TestServer {
     let config = Arc::new(Config::test_config());
     let state = AppState::new_for_test(config).await;
-    TestServer::new(create_router().with_state(state)).unwrap()
+    TestServer::new(create_router().await.with_state(state)).unwrap()
 }
 
 // ── Endpoint tests ────────────────────────────────────────────────────────────

@@ -9,8 +9,26 @@ pub struct Database {
 impl Database {
     /// Create new database connection
     pub async fn new(db_path: &str) -> anyhow::Result<Self> {
-        let connection_string = format!("sqlite:{}", db_path);
+        let connection_string = format!("sqlite:{}?mode=rwc", db_path);
         let pool = SqlitePool::connect(&connection_string).await?;
+
+        // Initialize schema if memory DB or new file
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                format TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                parameter_size TEXT,
+                quantization TEXT,
+                compatible_backends TEXT NOT NULL,
+                last_used TIMESTAMP,
+                tags TEXT NOT NULL
+            );"
+        )
+        .execute(&pool)
+        .await?;
 
         Ok(Self { pool })
     }

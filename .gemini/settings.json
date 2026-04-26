@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "name": "welcome-message",
+            "type": "command",
+            "command": "./.gemini/hooks/welcome.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "aliases": {
+    "nix-dev": "nix develop --command",
+    "just": "nix develop --command just"
+  }
+}

@@ -12,6 +12,14 @@ impl VramMonitorTrait for VramMonitor {
     fn get_state(&self) -> VramState {
         self.get_state()
     }
+    
+    fn can_fit(&self, required_gb: f64, safety_margin: f64) -> bool {
+        self.can_fit(required_gb, safety_margin)
+    }
+    
+    fn recommend_layers(&self, model_size_gb: f64) -> u32 {
+        self.recommend_layers(model_size_gb)
+    }
 }
 
 impl VramMonitor {

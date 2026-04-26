@@ -8,15 +8,17 @@
 
 
 
+pub mod llamacpp;
+
 use crate::models::BackendInfo;
 
 pub struct BackendDriver;
 
 impl BackendDriver {
     /// Detect and return all available backends
-    pub async fn list_backends() -> Vec<BackendInfo> {
+    pub async fn list_backends() -> anyhow::Result<Vec<BackendInfo>> {
         // TODO: Implement backend detection
-        vec![]
+        Ok(vec![])
     }
 
     /// Load model on specified backend
@@ -52,8 +54,11 @@ impl BackendDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::{mock, Matcher};
+    use mockito::Matcher;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn test_list_backends_active_llamacpp
+    async fn test_list_backends_active_llamacpp() {
+        // TODO: implement
+    }
+}

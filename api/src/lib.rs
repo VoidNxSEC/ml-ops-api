@@ -4,6 +4,7 @@ pub mod db;
 pub mod health;
 pub mod inference;
 pub mod models;
+pub mod nats;
 pub mod vram;
 pub mod websocket;
 
@@ -13,6 +14,8 @@ use models::VramState;
 #[async_trait::async_trait]
 pub trait VramMonitorTrait: Send + Sync {
     fn get_state(&self) -> VramState;
+    fn can_fit(&self, required_gb: f64, safety_margin: f64) -> bool;
+    fn recommend_layers(&self, model_size_gb: f64) -> u32;
 }
 
 use axum::{
@@ -35,6 +38,52 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub vram_monitor: Arc<RwLock<dyn VramMonitorTrait>>,
     pub config: Arc<Config>,
+    pub nats_publisher: Arc<nats::NatsPublisher>,
+    pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
+}
+
+impl AppState {
+    pub async fn new_for_test(config: Arc<Config>) -> Self {
+        let db_path = ":memory:".to_string();
+        let db = Arc::new(Database::new(&db_path).await.unwrap());
+        let vram_monitor = Arc::new(RwLock::new(DummyVramMonitor));
+        let nats_publisher = Arc::new(nats::NatsPublisher::connect("nats://localhost:4222").await);
+        let (ws_sender, _) = tokio::sync::broadcast::channel(100);
+        Self {
+            db,
+            vram_monitor,
+            config,
+            nats_publisher,
+            ws_sender: Arc::new(ws_sender),
+        }
+    }
+}
+
+pub struct DummyVramMonitor;
+#[async_trait::async_trait]
+impl VramMonitorTrait for DummyVramMonitor {
+    fn get_state(&self) -> models::VramState {
+        models::VramState {
+            total_gb: 24.0,
+            used_gb: 12.0,
+            free_gb: 12.0,
+            utilization_percent: 50.0,
+            gpus: vec![],
+            processes: vec![],
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+    
+    fn can_fit(&self, required_gb: f64, safety_margin: f64) -> bool {
+        let margin_gb = required_gb * safety_margin;
+        (required_gb + margin_gb) <= 12.0
+    }
+    
+    fn recommend_layers(&self, model_size_gb: f64) -> u32 {
+        let per_layer = model_size_gb / 32.0;
+        let max_layers = ((12.0 - 0.5) / per_layer).floor() as u32;
+        max_layers.min(32)
+    }
 }
 
 /// Configuration from environment variables
@@ -94,16 +143,6 @@ impl Config {
         }
     }
 
-    pub fn test_config() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            data_dir: "/tmp".to_string(),
-            models_path: "/tmp".to_string(),
-            db_path: ":memory:".to_string(),
-            cors_enabled: false,
-        }
-    }
 }
 
 pub async fn create_router() -> Router<AppState> {
@@ -189,21 +228,14 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn list_backends_handler() -> impl IntoResponse {
-    tokio::task::spawn_blocking(|| async {
-        match BackendDriver::list_backends().await {
-            Ok(backends) => Ok::<_, StatusCode>(Json(backends)),
-            Err(e) => {
-                warn!("Backend list error: {}", e);
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+async fn list_backends_handler() -> Result<impl IntoResponse, StatusCode> {
+    match BackendDriver::list_backends().await {
+        Ok(backends) => Ok(Json(backends)),
+        Err(e) => {
+            warn!("Backend list error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-    })
-    .await
-    .unwrap()
-    .unwrap_or_else(|_| {
-        Json(ApiResponse::error("Failed to list backends".to_string()))
-    })
+    }
 }
 
 #[derive(Deserialize)]
@@ -279,17 +311,17 @@ async fn vram_handler(State(state): State<AppState>) -> impl IntoResponse {
     let vram_monitor = state.vram_monitor.read().await;
     let vram_state = vram_monitor.get_state();
 
-    Json(vram_state),
+    Json(vram_state)
 }
 
 async fn load_model_handler(
     State(state): State<AppState>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    let model_path = match req.model_id {
+    let (model_path, model_size_gb) = match req.model_id {
         Some(id) => {
             match state.db.get_model_by_id(id).await {
-                Ok(Some(model)) => model.path,
+                Ok(Some(model)) => (model.path, Some(model.size_gb)),
                 Ok(None) => return Json(ApiResponse::error("Model not found".to_string())),
                 Err(e) => {
                     warn!("DB error: {}", e);
@@ -297,13 +329,33 @@ async fn load_model_handler(
                 }
             }
         }
-        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+        None => match req.model_path {
+            Some(p) => (p, None),
+            None => return Json(ApiResponse::error("Model ID or path required".to_string())),
+        },
     };
 
-    match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
+    let mut gpu_layers = req.gpu_layers;
+    let vram_monitor = state.vram_monitor.read().await;
+
+    // Intelligent VRAM offloading
+    if let Some(size_gb) = model_size_gb {
+        if !vram_monitor.can_fit(size_gb, 0.1) {
+            warn!("Model size ({:.2} GB) exceeds available VRAM + safety margin.", size_gb);
+        }
+        
+        if gpu_layers.is_none() {
+            let recommended = vram_monitor.recommend_layers(size_gb);
+            tracing::info!("Auto-recommending {} GPU layers based on available VRAM for {:.2} GB model", recommended, size_gb);
+            gpu_layers = Some(recommended);
+        }
+    }
+
+    let model_path_str = model_path.as_str();
+    match BackendDriver::load_model(&req.backend, model_path_str, gpu_layers).await {
         Ok(()) => Json(ApiResponse::success("Model loaded successfully".to_string())),
         Err(e) => {
-            warn!("Load failed for {} on {}: {}", model_path, req.backend, e);
+            warn!("Load failed for {} on {}: {}", model_path_str, req.backend, e);
             Json(ApiResponse::error(format!("Load failed: {}", e)))
         }
     }
@@ -342,7 +394,10 @@ async fn switch_model_handler(
                 }
             }
         }
-        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+        None => match req.model_path {
+            Some(p) => p,
+            None => return Json(ApiResponse::error("Model ID or path required".to_string())),
+        },
     };
 
     match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
@@ -357,12 +412,4 @@ async fn switch_model_handler(
 
 
 
-Assistant: I created lib.rs that extracts the router creation and handlers.
 
-Now, I need to adjust the integration tests to use axum_test instead.
-
-Let me rewrite the integration test to use axum_test::TestServer.
-
-First, add sqlx with features for SQLite in-memory.
-
-Add to Cargo.toml.

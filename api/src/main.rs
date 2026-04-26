@@ -26,7 +26,14 @@ mod nats;
 mod vram;
 mod websocket;
 
-use crate::VramMonitorTrait;
+use models::VramState;
+
+#[async_trait::async_trait]
+pub trait VramMonitorTrait: Send + Sync {
+    fn get_state(&self) -> VramState;
+    fn can_fit(&self, required_gb: f64, safety_margin: f64) -> bool;
+    fn recommend_layers(&self, model_size_gb: f64) -> u32;
+}
 
 use db::Database;
 use vram::VramMonitor;
@@ -38,6 +45,7 @@ pub struct AppState {
     vram_monitor: Arc<RwLock<dyn VramMonitorTrait>>,
     config: Arc<Config>,
     pub nats_publisher: Arc<nats::NatsPublisher>,
+    pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
 }
 
 /// Configuration from environment variables
@@ -83,6 +91,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Initialize Prometheus exporter
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let prometheus_handle = builder.install_recorder().expect("failed to install recorder");
+    info!("Prometheus metrics initialized");
+
     // Load configuration
     let config = Arc::new(Config::from_env());
     info!("Starting ML Offload Manager API");
@@ -105,18 +118,47 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_publisher = Arc::new(nats::NatsPublisher::connect(&nats_url).await);
 
+    // Initialize global WebSocket broadcaster
+    let (ws_sender, _) = tokio::sync::broadcast::channel(100);
+
     // Create application state
     let app_state = AppState {
         db,
         vram_monitor,
         config: config.clone(),
         nats_publisher,
+        ws_sender: Arc::new(ws_sender),
     };
+
+    // Spawn global VRAM monitoring task for WebSocket broadcast
+    let ws_state = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if ws_state.ws_sender.receiver_count() > 0 {
+                let vram_monitor = ws_state.vram_monitor.read().await;
+                let vram_state = vram_monitor.get_state();
+                let event = websocket::WsEvent::VramUpdate {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    total_gb: vram_state.total_gb,
+                    used_gb: vram_state.used_gb,
+                    free_gb: vram_state.free_gb,
+                    utilization_percent: vram_state.utilization_percent,
+                };
+                let _ = websocket::broadcast_event(&ws_state, event).await;
+            }
+        }
+    });
 
     // Build router
     let app = Router::new()
         // Root endpoint
         .route("/", get(root_handler))
+        // Prometheus metrics
+        .route("/metrics", get(move || async move {
+            prometheus_handle.render()
+        }))
         // Health check (basic)
         .route("/health", get(health_handler))
         // API health check (detailed backend status)
@@ -210,21 +252,14 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn list_backends_handler() -> impl IntoResponse {
-    tokio::task::spawn_blocking(|| async {
-        match BackendDriver::list_backends().await {
-            Ok(backends) => Ok::<_, StatusCode>(Json(backends)),
-            Err(e) => {
-                warn!("Backend list error: {}", e);
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+async fn list_backends_handler() -> Result<impl IntoResponse, StatusCode> {
+    match BackendDriver::list_backends().await {
+        Ok(backends) => Ok(Json(backends)),
+        Err(e) => {
+            warn!("Backend list error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-    })
-    .await
-    .unwrap()
-    .unwrap_or_else(|_| {
-        Json(ApiResponse::error("Failed to list backends".to_string()))
-    })
+    }
 }
 
 #[derive(Deserialize)]
@@ -317,10 +352,10 @@ async fn load_model_handler(
     State(state): State<AppState>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    let model_path = match req.model_id {
+    let (model_path, model_size_gb) = match req.model_id {
         Some(id) => {
             match state.db.get_model_by_id(id).await {
-                Ok(Some(model)) => model.path,
+                Ok(Some(model)) => (model.path, Some(model.size_gb)),
                 Ok(None) => return Json(ApiResponse::error("Model not found".to_string())),
                 Err(e) => {
                     warn!("DB error: {}", e);
@@ -328,13 +363,33 @@ async fn load_model_handler(
                 }
             }
         }
-        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+        None => match req.model_path {
+            Some(p) => (p, None),
+            None => return Json(ApiResponse::error("Model ID or path required".to_string())),
+        },
     };
 
-    match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
+    let mut gpu_layers = req.gpu_layers;
+    let vram_monitor = state.vram_monitor.read().await;
+
+    // Intelligent VRAM offloading
+    if let Some(size_gb) = model_size_gb {
+        if !vram_monitor.can_fit(size_gb, 0.1) {
+            warn!("Model size ({:.2} GB) exceeds available VRAM + safety margin.", size_gb);
+        }
+        
+        if gpu_layers.is_none() {
+            let recommended = vram_monitor.recommend_layers(size_gb);
+            tracing::info!("Auto-recommending {} GPU layers based on available VRAM for {:.2} GB model", recommended, size_gb);
+            gpu_layers = Some(recommended);
+        }
+    }
+
+    let model_path_str = model_path.as_str();
+    match BackendDriver::load_model(&req.backend, model_path_str, gpu_layers).await {
         Ok(()) => Json(ApiResponse::success("Model loaded successfully".to_string())),
         Err(e) => {
-            warn!("Load failed for {} on {}: {}", model_path, req.backend, e);
+            warn!("Load failed for {} on {}: {}", model_path_str, req.backend, e);
             Json(ApiResponse::error(format!("Load failed: {}", e)))
         }
     }
@@ -373,7 +428,10 @@ async fn switch_model_handler(
                 }
             }
         }
-        None => req.model_path.unwrap_or_else(|| return Json(ApiResponse::error("Model ID or path required".to_string()))),
+        None => match req.model_path {
+            Some(p) => p,
+            None => return Json(ApiResponse::error("Model ID or path required".to_string())),
+        },
     };
 
     match BackendDriver::load_model(&req.backend, &model_path, req.gpu_layers).await {
