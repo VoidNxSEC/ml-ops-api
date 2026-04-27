@@ -24,6 +24,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::backends::llamacpp::{LlamaCppBackend, LlamaCppConfig};
+use crate::orchestrator::Priority;
 use crate::AppState;
 
 // =============================================================================
@@ -195,28 +196,32 @@ fn default_encoding_format() -> String {
 
 pub async fn chat_completions_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     info!("Chat completion request for model: {}", request.model);
-    
-    // Validate request
+
     if request.messages.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": {
-                    "message": "messages array cannot be empty",
-                    "type": "invalid_request_error"
-                }
+                "error": { "message": "messages array cannot be empty", "type": "invalid_request_error" }
             })),
-        ).into_response();
+        )
+            .into_response();
     }
-    
+
+    // X-Priority: critical | high | normal | low  (default: normal)
+    let priority = headers
+        .get("x-priority")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+
     if request.stream {
         streaming_response(state, request).await
     } else {
-        // Return single response
-        match non_streaming_response(state, request).await {
+        match non_streaming_response(state, request, priority).await {
             Ok(response) => response.into_response(),
             Err(err) => err.into_response(),
         }
@@ -226,13 +231,14 @@ pub async fn chat_completions_handler(
 async fn non_streaming_response(
     state: AppState,
     request: ChatCompletionRequest,
+    priority: Priority,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let request_id = Uuid::new_v4();
     let start = Instant::now();
     let model = request.model.clone();
     let messages_count = request.messages.len();
 
-    // Publish inference.request.v1 (fire-and-forget)
+    // Fire-and-forget: publish inference.request.v1
     {
         let publisher = state.nats_publisher.clone();
         let m = model.clone();
@@ -241,88 +247,41 @@ async fn non_streaming_response(
         });
     }
 
-    // Create llamacpp backend client
-    let backend = match LlamaCppBackend::with_defaults() {
-        Ok(b) => b,
+    info!(request_id = %request_id, model = %model, %priority, "enqueuing");
+
+    let request_json = serde_json::to_value(&request).unwrap_or_default();
+
+    // Submit to orchestrator — priority queue + N workers + concurrency limiter
+    let raw = match state.orchestrator.submit(request_json, priority).await {
+        Ok(v) => v,
         Err(e) => {
-            warn!("Failed to create llamacpp backend: {}", e);
+            warn!(request_id = %request_id, err = %e, "orchestrator error");
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "Failed to initialize backend",
-                        "type": "internal_error"
-                    }
-                })),
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": { "message": e, "type": "backend_error" } })),
             ));
         }
     };
-    
-    // Convert request to JSON for proxying
-    let request_json = serde_json::to_value(&request).unwrap();
-    
-    // Proxy to llama-server
-    match backend.proxy_chat_completion(request_json).await {
-        Ok(response) => {
-            let status = response.status();
-            let body = response.bytes().await.unwrap_or_default();
-            
-            if status.is_success() {
-                // Parse and return the response
-                match serde_json::from_slice::<ChatCompletionResponse>(&body) {
-                    Ok(chat_response) => {
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        let completion_tokens = chat_response.usage.completion_tokens;
-                        let publisher = state.nats_publisher.clone();
-                        let m = model.clone();
-                        tokio::spawn(async move {
-                            publisher
-                                .publish_inference_response(
-                                    request_id,
-                                    &m,
-                                    completion_tokens,
-                                    duration_ms,
-                                    "success",
-                                )
-                                .await;
-                        });
-                        Ok(Json(chat_response))
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse llama-server response: {}", e);
-                        Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": "Failed to parse backend response",
-                                    "type": "internal_error"
-                                }
-                            })),
-                        ))
-                    }
-                }
-            } else {
-                warn!("llama-server returned error: {}", status);
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": "Backend returned error",
-                            "type": "backend_error"
-                        }
-                    })),
-                ))
-            }
+
+    match serde_json::from_value::<ChatCompletionResponse>(raw) {
+        Ok(chat_response) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let completion_tokens = chat_response.usage.completion_tokens;
+            let publisher = state.nats_publisher.clone();
+            let m = model.clone();
+            tokio::spawn(async move {
+                publisher
+                    .publish_inference_response(request_id, &m, completion_tokens, duration_ms, "success")
+                    .await;
+            });
+            Ok(Json(chat_response))
         }
         Err(e) => {
-            warn!("Failed to proxy to llama-server: {}", e);
+            warn!(request_id = %request_id, err = %e, "response parse error");
             Err((
-                StatusCode::BAD_GATEWAY,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": {
-                        "message": "Failed to connect to backend",
-                        "type": "connection_error"
-                    }
+                    "error": { "message": "Failed to parse backend response", "type": "internal_error" }
                 })),
             ))
         }

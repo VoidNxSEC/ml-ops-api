@@ -23,6 +23,7 @@ mod health;
 mod inference;
 mod models;
 mod nats;
+mod orchestrator;
 mod router;
 mod vram;
 mod websocket;
@@ -37,6 +38,7 @@ pub trait VramMonitorTrait: Send + Sync {
 }
 
 use db::Database;
+use orchestrator::{OrchestratorConfig, OrchestratorHandle};
 use router::BackendRouter;
 use vram::VramMonitor;
 
@@ -49,6 +51,7 @@ pub struct AppState {
     pub nats_publisher: Arc<nats::NatsPublisher>,
     pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
     pub router: Arc<BackendRouter>,
+    pub orchestrator: OrchestratorHandle,
 }
 
 /// Configuration from environment variables
@@ -128,6 +131,10 @@ async fn main() -> anyhow::Result<()> {
     let backend_router = Arc::new(BackendRouter::from_env());
     info!("Backend router initialized");
 
+    // Spawn orchestrator worker pool
+    let orch_config = OrchestratorConfig::from_env();
+    let orch = orchestrator::spawn(backend_router.clone(), orch_config);
+
     // Create application state
     let app_state = AppState {
         db,
@@ -136,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         nats_publisher,
         ws_sender: Arc::new(ws_sender),
         router: backend_router,
+        orchestrator: orch,
     };
 
     // Spawn global VRAM monitoring task for WebSocket broadcast

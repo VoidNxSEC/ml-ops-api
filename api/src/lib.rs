@@ -5,6 +5,7 @@ pub mod health;
 pub mod inference;
 pub mod models;
 pub mod nats;
+pub mod orchestrator;
 pub mod router;
 pub mod vram;
 pub mod websocket;
@@ -31,6 +32,7 @@ use tower_http::{
 };
 
 use db::Database;
+use orchestrator::{OrchestratorConfig, OrchestratorHandle};
 use router::BackendRouter;
 use vram::VramMonitor;
 
@@ -43,6 +45,7 @@ pub struct AppState {
     pub nats_publisher: Arc<nats::NatsPublisher>,
     pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
     pub router: Arc<BackendRouter>,
+    pub orchestrator: OrchestratorHandle,
 }
 
 impl AppState {
@@ -53,6 +56,12 @@ impl AppState {
         let nats_publisher = Arc::new(nats::NatsPublisher::connect("nats://localhost:4222").await);
         let (ws_sender, _) = tokio::sync::broadcast::channel(100);
         let router = Arc::new(BackendRouter::from_env());
+        let orch_config = OrchestratorConfig {
+            workers: 1,
+            max_concurrent: 2,
+            ..Default::default()
+        };
+        let orchestrator = orchestrator::spawn(router.clone(), orch_config);
         Self {
             db,
             vram_monitor,
@@ -60,6 +69,7 @@ impl AppState {
             nats_publisher,
             ws_sender: Arc::new(ws_sender),
             router,
+            orchestrator,
         }
     }
 }
