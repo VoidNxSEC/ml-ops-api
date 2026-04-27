@@ -88,9 +88,64 @@ impl VllmBackend {
         Ok(body.data)
     }
 
+    /// GET /metrics — scrape Prometheus exposition and extract request pressure.
+    /// Returns `(running, waiting, total_capacity)` if parseable, else None.
+    ///
+    /// Key metrics used:
+    ///   vllm:num_requests_running   — slots actively generating
+    ///   vllm:num_requests_waiting   — requests queued (scheduler backpressure)
+    ///   vllm:gpu_cache_usage_perc   — KV cache fill %
+    pub async fn get_capacity(&self) -> Option<(u32, u32)> {
+        let text = self
+            .client
+            .get(format!("{}/metrics", self.config.base_url))
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+
+        let mut running: Option<f64> = None;
+        let mut waiting: Option<f64> = None;
+
+        for line in text.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if let Some(val) = extract_metric(line, "vllm:num_requests_running") {
+                running = Some(val);
+            }
+            if let Some(val) = extract_metric(line, "vllm:num_requests_waiting") {
+                waiting = Some(val);
+            }
+        }
+
+        // slots_free = inverse of running; we approximate max_concurrent from the
+        // gpu_cache_usage metric (0% usage ≈ all slots free).
+        // Since vLLM doesn't expose a fixed slot count, treat running + waiting
+        // as load: (0, running+waiting) → caller uses this for load scoring.
+        let r = running.unwrap_or(0.0) as u32;
+        let w = waiting.unwrap_or(0.0) as u32;
+
+        // Return (idle_estimate, total_estimate): idle = 0 when under load
+        // total is arbitrary; router normalises via ratio — use 16 as baseline
+        let total: u32 = 16;
+        let busy = (r + w).min(total);
+        Some((total - busy, total))
+    }
+
     pub fn base_url(&self) -> &str {
         &self.config.base_url
     }
+}
+
+/// Parse `<metric_name>{...} <value>` or `<metric_name> <value>` lines.
+fn extract_metric(line: &str, name: &str) -> Option<f64> {
+    if !line.starts_with(name) {
+        return None;
+    }
+    line.split_whitespace().last()?.parse().ok()
 }
 
 #[cfg(test)]

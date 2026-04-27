@@ -62,12 +62,7 @@ pub struct SlotInfo {
     pub task_id: Option<u32>,
 }
 
-/// Slots response from llama-server
-#[derive(Debug, Deserialize)]
-struct SlotsResponse {
-    #[serde(default)]
-    slots: Vec<SlotInfo>,
-}
+// llama-server /slots returns a JSON array directly (not wrapped in an object)
 
 impl LlamaCppBackend {
     /// Create new llama.cpp backend client
@@ -137,8 +132,10 @@ impl LlamaCppBackend {
         Ok(info)
     }
 
-    /// Get slot information for concurrent request management
-    pub async fn get_slots(&self) -> Result<Vec<SlotInfo>> {
+    /// Get slot information for concurrent request management.
+    /// Returns (idle_slots, total_slots).
+    /// llama-server /slots returns a JSON array; each element has "state" (0=idle, 1=processing).
+    pub async fn get_slots(&self) -> Result<(u32, u32)> {
         let url = format!("{}/slots", self.config.base_url);
 
         let response = self
@@ -152,12 +149,33 @@ impl LlamaCppBackend {
             anyhow::bail!("Get slots failed with status: {}", response.status());
         }
 
-        let slots_response: SlotsResponse = response
+        // Deserialize as raw array — each slot has at minimum an "id" and "state" (int)
+        let slots: Vec<serde_json::Value> = response
             .json()
             .await
             .context("Failed to parse slots response")?;
 
-        Ok(slots_response.slots)
+        let total = slots.len() as u32;
+        let idle = slots
+            .iter()
+            .filter(|s| s["state"].as_u64().unwrap_or(1) == 0)
+            .count() as u32;
+
+        Ok((idle, total))
+    }
+
+    /// Check whether the currently loaded model matches `model_path`.
+    pub async fn current_model_matches(&self, model_path: &str) -> bool {
+        self.get_model_info()
+            .await
+            .ok()
+            .map(|info| info.model == model_path || info.model.contains(
+                std::path::Path::new(model_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(model_path),
+            ))
+            .unwrap_or(false)
     }
 
     /// Proxy chat completion request to llama-server

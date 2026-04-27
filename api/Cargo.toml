@@ -55,6 +55,7 @@ async-trait = "0.1"
 tempfile = "3.8"
 metrics = "0.24.3"
 metrics-exporter-prometheus = "0.18.1"
+governor = "0.6"
 
 [dev-dependencies]
 tokio-test        = "0.4"

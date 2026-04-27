@@ -1,35 +1,94 @@
-# ML Offload API Infrastructure
-# Services: MLflow (experiment tracking), PostgreSQL
+# ML Offload API — full dev stack
+#
+# Secrets: copy .env.example → .env.secrets and fill in values.
+#   ML_OFFLOAD_API_KEYS=key1,key2
+#   POSTGRES_PASSWORD=changeme
+#
+# Model files: bind-mount the host directory that holds your GGUF files.
+#   Set MODELS_PATH env var or edit the volumes section below.
+#
+# NATS: provided by the spectre stack (~/master/spectre).
+#   Start spectre first: cd ~/master/spectre && docker compose up -d
+#   This stack joins spectre-net so it can reach spectre-nats:4222.
+#   To publish events without spectre running, leave NATS_URL empty
+#   (the api disables NATS publishing when the env var is unset).
+#
+# llama-server: optional GPU service. Uncomment the llama-server section
+# and set LLAMA_MODEL to the path of your model inside the models mount.
 
 services:
+
+  # ── Inference gateway ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ml-offload-api:dev
+    container_name: ml-offload-api
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      ML_OFFLOAD_HOST: "0.0.0.0"
+      ML_OFFLOAD_PORT: "9000"
+      LLAMACPP_URL: "http://llama-server:8080"
+      # NATS lives in the spectre stack — spectre-net must be up.
+      # Unset or empty = NATS publishing disabled (safe for offline dev).
+      NATS_URL: "${NATS_URL:-nats://spectre-nats:4222}"
+      ORCHESTRATOR_WORKERS: "4"
+      ORCHESTRATOR_MAX_CONCURRENT: "8"
+      ORCHESTRATOR_TIMEOUT_SECS: "300"
+      CIRCUIT_BREAKER_THRESHOLD: "3"
+      CIRCUIT_BREAKER_COOLDOWN_SECS: "30"
+      ML_OFFLOAD_RATE_LIMIT_RPM: "60"
+      RUST_LOG: "ml_offload_api=info,axum=info,tower_http=warn"
+    env_file:
+      - path: .env.secrets   # ML_OFFLOAD_API_KEYS, etc. — never committed
+        required: false       # dev fallback: no auth enforced when file absent
+    volumes:
+      - ml_offload_data:/var/lib/ml-offload
+      - ${MODELS_PATH:-/var/lib/ml-models}:/var/lib/ml-models:ro
+    networks:
+      - mloffload-net
+      - spectre-net       # reach spectre-nats without exposing its port
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 6
+
+  # ── MLflow experiment tracking ───────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
-    container_name: mloffload-postgres
+    container_name: ml-offload-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: mloffload
-      POSTGRES_PASSWORD: mloffload
-      POSTGRES_DB: mloffload
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: mlflow
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mloffload-net
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U mloffload" ]
+      test: ["CMD-SHELL", "pg_isready -U mloffload -d mlflow"]
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - mloffload-network
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.10.2
-    container_name: mloffload-mlflow
+    container_name: ml-offload-mlflow
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     command: >
       mlflow server
-        --backend-store-uri postgresql://mloffload:mloffload@postgres:5432/mloffload
+        --backend-store-uri postgresql://mloffload:${POSTGRES_PASSWORD:-changeme}@postgres:5432/mlflow
         --default-artifact-root /mlflow/artifacts
         --host 0.0.0.0
         --port 5000
@@ -37,20 +96,56 @@ services:
       - "5000:5000"
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
-    environment:
-      - MLFLOW_TRACKING_URI=http://0.0.0.0:5000
+    networks:
+      - mloffload-net
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/')"]
       interval: 30s
       timeout: 10s
+      start_period: 15s
       retries: 5
-    networks:
-      - mloffload-network
+
+  # ── llama-server (optional — requires NVIDIA GPU) ─────────────────────────────
+  # Uncomment to run llama.cpp locally. Needs nvidia-container-toolkit.
+  #
+  # llama-server:
+  #   image: ghcr.io/ggerganov/llama.cpp:server-cuda
+  #   container_name: ml-offload-llama
+  #   restart: unless-stopped
+  #   command: >
+  #     --model /models/${LLAMA_MODEL:-model.gguf}
+  #     --host 0.0.0.0
+  #     --port 8080
+  #     --n-gpu-layers 999
+  #     --parallel 4
+  #     --ctx-size 4096
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ${MODELS_PATH:-/var/lib/ml-models}:/models:ro
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   networks:
+  #     - mloffload-net
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 6
 
 networks:
-  mloffload-network:
+  mloffload-net:
     driver: bridge
+  spectre-net:
+    external: true   # owned by ~/master/spectre — start that stack first
 
 volumes:
+  ml_offload_data:
   postgres_data:
   mlflow_artifacts:

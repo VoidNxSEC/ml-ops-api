@@ -30,7 +30,10 @@ use serde_json::Value;
 use tokio::sync::{oneshot, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
+use metrics::{counter, gauge, histogram};
+
 use crate::backends::llamacpp::{LlamaCppBackend, LlamaCppConfig};
+use crate::metrics as m;
 use crate::router::BackendRouter;
 
 // ── Priority ──────────────────────────────────────────────────────────────────
@@ -102,7 +105,18 @@ impl SharedQueue {
     }
 
     fn push(&self, req: PendingRequest, priority: Priority) {
-        self.queues.lock().unwrap()[priority as usize].push_back(req);
+        let depth = {
+            let mut qs = self.queues.lock().unwrap();
+            qs[priority as usize].push_back(req);
+            qs[priority as usize].len()
+        };
+        let prio_label = match priority {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+            Priority::Critical => "critical",
+        };
+        gauge!(m::QUEUE_DEPTH, "priority" => prio_label).set(depth as f64);
         self.notify.notify_one();
     }
 
@@ -238,7 +252,18 @@ pub fn spawn(router: Arc<BackendRouter>, config: OrchestratorConfig) -> Orchestr
 
             loop {
                 let req = q.pop().await;
-                let wait_ms = req.enqueued_at.elapsed().as_millis();
+                let wait_secs = req.enqueued_at.elapsed().as_secs_f64();
+
+                histogram!(m::QUEUE_WAIT_SECS).record(wait_secs);
+
+                // Update queue depth gauges after dequeue
+                {
+                    let depths = q.depths();
+                    for (i, &depth) in depths.iter().enumerate() {
+                        let prio = match i { 0 => "low", 1 => "normal", 2 => "high", _ => "critical" };
+                        gauge!(m::QUEUE_DEPTH, "priority" => prio).set(depth as f64);
+                    }
+                }
 
                 // Limit in-flight requests across all workers
                 let permit = match sem.acquire().await {
@@ -249,11 +274,15 @@ pub fn spawn(router: Arc<BackendRouter>, config: OrchestratorConfig) -> Orchestr
                     }
                 };
 
-                debug!(worker = worker_id, wait_ms, "dispatching");
+                gauge!(m::IN_FLIGHT).increment(1.0);
+                debug!(worker = worker_id, wait_secs, "dispatching");
 
+                let start = std::time::Instant::now();
                 let result =
                     tokio::time::timeout(timeout, execute(&r, req.request_json)).await;
 
+                let latency = start.elapsed().as_secs_f64();
+                gauge!(m::IN_FLIGHT).decrement(1.0);
                 drop(permit); // Release before sending reply — free slot ASAP
 
                 let outcome = match result {
@@ -261,8 +290,11 @@ pub fn spawn(router: Arc<BackendRouter>, config: OrchestratorConfig) -> Orchestr
                     Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
                 };
 
+                histogram!(m::REQUEST_LATENCY_SECS).record(latency);
+
                 if let Err(ref e) = outcome {
                     warn!(worker = worker_id, err = %e, "request failed");
+                    counter!(m::REQUESTS_FAILED).increment(1);
                 }
 
                 // rx may be dropped if caller cancelled — that's fine
@@ -289,26 +321,60 @@ async fn execute(router: &BackendRouter, request_json: Value) -> Result<Value, S
         .await
         .ok_or_else(|| "no backends available".to_string())?;
 
+    let backend_id = selected.config.id.clone();
+
     let backend = LlamaCppBackend::new(LlamaCppConfig {
         base_url: selected.base_url().to_string(),
         timeout_secs: 300,
     })
     .map_err(|e| e.to_string())?;
 
-    debug!(backend = %selected.config.id, score = selected.score, "executing");
+    let model = request_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let start = std::time::Instant::now();
 
-    let resp = backend
-        .proxy_chat_completion(request_json)
-        .await
-        .map_err(|e| e.to_string())?;
+    debug!(backend = %backend_id, score = selected.score, model = %model, "executing");
 
-    if !resp.status().is_success() {
-        return Err(format!("backend {} returned {}", selected.config.id, resp.status()));
+    let result = async {
+        let resp = backend
+            .proxy_chat_completion(request_json)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("backend {} returned {}", backend_id, resp.status()));
+        }
+
+        let body = resp.bytes().await.map_err(|e| e.to_string())?;
+        serde_json::from_slice::<Value>(&body).map_err(|e| format!("parse error: {e}"))
+    }
+    .await;
+
+    let latency_ms = start.elapsed().as_millis();
+
+    match &result {
+        Ok(v) => {
+            let usage = &v["usage"];
+            info!(
+                backend = %backend_id,
+                model = %model,
+                latency_ms,
+                prompt_tokens     = usage["prompt_tokens"].as_u64().unwrap_or(0),
+                completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0),
+                total_tokens      = usage["total_tokens"].as_u64().unwrap_or(0),
+                "inference ok"
+            );
+        }
+        Err(e) => {
+            warn!(backend = %backend_id, model = %model, latency_ms, err = %e, "inference failed");
+            router.report_failure(&backend_id).await;
+        }
     }
 
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
-
-    serde_json::from_slice::<Value>(&body).map_err(|e| format!("parse error: {e}"))
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

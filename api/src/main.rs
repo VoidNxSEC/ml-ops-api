@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -17,10 +18,12 @@ use crate::backends::BackendDriver;
 use tracing::{info, warn};
 
 mod api;
+mod auth;
 mod backends;
 mod db;
 mod health;
 mod inference;
+mod metrics;
 mod models;
 mod nats;
 mod orchestrator;
@@ -52,6 +55,8 @@ pub struct AppState {
     pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
     pub router: Arc<BackendRouter>,
     pub orchestrator: OrchestratorHandle,
+    pub api_keys: Arc<std::collections::HashSet<String>>,
+    pub rate_limiter: Arc<auth::KeyedLimiter>,
 }
 
 /// Configuration from environment variables
@@ -97,9 +102,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Initialize Prometheus exporter
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-    let prometheus_handle = builder.install_recorder().expect("failed to install recorder");
+    // Initialize Prometheus exporter with histogram buckets
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(metrics::QUEUE_WAIT_SECS.to_string()),
+            &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0],
+        )
+        .expect("invalid queue_wait buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(metrics::REQUEST_LATENCY_SECS.to_string()),
+            &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+        )
+        .expect("invalid latency buckets")
+        .install_recorder()
+        .expect("failed to install recorder");
+    metrics::describe_all();
     info!("Prometheus metrics initialized");
 
     // Load configuration
@@ -135,6 +152,15 @@ async fn main() -> anyhow::Result<()> {
     let orch_config = OrchestratorConfig::from_env();
     let orch = orchestrator::spawn(backend_router.clone(), orch_config);
 
+    // Initialize auth + rate limiter
+    let api_keys = auth::api_keys_from_env();
+    if api_keys.is_empty() {
+        info!("Auth: dev mode — ML_OFFLOAD_API_KEYS not set, all requests allowed");
+    } else {
+        info!("Auth: {} API key(s) configured", api_keys.len());
+    }
+    let rate_limiter = auth::rate_limiter_from_env();
+
     // Create application state
     let app_state = AppState {
         db,
@@ -144,6 +170,8 @@ async fn main() -> anyhow::Result<()> {
         ws_sender: Arc::new(ws_sender),
         router: backend_router,
         orchestrator: orch,
+        api_keys,
+        rate_limiter,
     };
 
     // Spawn global VRAM monitoring task for WebSocket broadcast
@@ -167,42 +195,40 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Build router
-    let app = Router::new()
-        // Root endpoint
-        .route("/", get(root_handler))
-        // Prometheus metrics
-        .route("/metrics", get(move || async move {
-            prometheus_handle.render()
-        }))
-        // Health check (basic)
-        .route("/health", get(health_handler))
-        // API health check (detailed backend status)
-        .route("/api/health", get(health::health_check_handler))
-        .route("/api/backend/info", get(health::backend_info_handler))
-        // Backends
-        .route("/backends", get(list_backends_handler))
-        // Models
-        .route("/models", get(list_models_handler))
-        .route("/models/:id", get(get_model_handler))
-        .route("/models/scan", post(trigger_scan_handler))
-        // Status
-        .route("/status", get(status_handler))
-        // VRAM
-        .route("/vram", get(vram_handler))
-        // WebSocket
-        .route("/ws", get(websocket::websocket_handler))
-        // OpenAI-compatible inference endpoints
+    // Protected inference routes: auth then rate-limit
+    let inference = Router::new()
         .route("/v1/models", get(inference::list_models_openai_handler))
         .route("/v1/chat/completions", post(inference::chat_completions_handler))
         .route("/v1/embeddings", post(inference::embeddings_handler))
-        // Load/Unload/Switch
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth::rate_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth::auth_middleware,
+        ));
+
+    // Build router
+    let app = Router::new()
+        .route("/", get(root_handler))
+        .route("/metrics", get(move || async move { prometheus_handle.render() }))
+        .route("/health", get(health_handler))
+        .route("/api/health", get(health::health_check_handler))
+        .route("/api/backend/info", get(health::backend_info_handler))
+        .route("/api/stats", get(stats_handler))
+        .route("/backends", get(list_backends_handler))
+        .route("/models", get(list_models_handler))
+        .route("/models/:id", get(get_model_handler))
+        .route("/models/scan", post(trigger_scan_handler))
+        .route("/status", get(status_handler))
+        .route("/vram", get(vram_handler))
+        .route("/ws", get(websocket::websocket_handler))
         .route("/load", post(load_model_handler))
         .route("/unload", post(unload_model_handler))
         .route("/switch", post(switch_model_handler))
-        // Add state
+        .merge(inference)
         .with_state(app_state)
-        // Add middleware
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(false)),
@@ -457,4 +483,31 @@ async fn switch_model_handler(
             Json(ApiResponse::error(format!("Switch failed: {}", e)))
         }
     }
+}
+
+async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let depths = state.orchestrator.queue_depths();
+    let in_flight = state.orchestrator.in_flight();
+    let backends = state.router.list().await;
+
+    Json(serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "orchestrator": {
+            "in_flight": in_flight,
+            "queue": {
+                "low":      depths[0],
+                "normal":   depths[1],
+                "high":     depths[2],
+                "critical": depths[3],
+                "total":    depths[0] + depths[1] + depths[2] + depths[3],
+            }
+        },
+        "backends": backends.iter().map(|(cfg, alive, score)| serde_json::json!({
+            "id":       cfg.id,
+            "kind":     cfg.kind.to_string(),
+            "base_url": cfg.base_url,
+            "alive":    alive,
+            "score":    score,
+        })).collect::<Vec<_>>(),
+    }))
 }

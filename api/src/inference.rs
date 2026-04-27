@@ -23,7 +23,10 @@ use std::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use metrics::counter;
+
 use crate::backends::llamacpp::{LlamaCppBackend, LlamaCppConfig};
+use crate::metrics as m;
 use crate::orchestrator::Priority;
 use crate::AppState;
 
@@ -289,6 +292,7 @@ async fn non_streaming_response(
 }
 
 async fn streaming_response(state: AppState, request: ChatCompletionRequest) -> Response {
+    counter!(m::STREAMING_REQUESTS, "model" => request.model.clone()).increment(1);
     let request_id = Uuid::new_v4();
     let model = request.model.clone();
 
@@ -341,7 +345,13 @@ async fn streaming_response(state: AppState, request: ChatCompletionRequest) -> 
         }
     };
 
-    info!(request_id = %request_id, backend = %selected.config.id, "stream open");
+    info!(
+        request_id = %request_id,
+        backend    = %selected.config.id,
+        score      = selected.score,
+        model      = %model,
+        "stream open"
+    );
 
     Sse::new(sse_from_byte_stream(response.bytes_stream()))
         .keep_alive(

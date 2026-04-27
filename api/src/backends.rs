@@ -87,27 +87,106 @@ impl BackendDriver {
         Ok(backends)
     }
 
-    /// Load model on specified backend.
+    /// Load (or verify) a model on the specified backend.
+    ///
+    /// For llama.cpp: validates the model file exists, checks what's currently
+    /// loaded via /props, and returns success if it matches. If a different model
+    /// is loaded, triggers a systemd restart of llama-server with the new path.
+    /// If systemd is unavailable, returns an informative error.
     pub async fn load_model(
         backend: &str,
-        _model_path: &str,
-        _gpu_layers: Option<u32>,
+        model_path: &str,
+        gpu_layers: Option<u32>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("Backend loading not implemented for: {}", backend)
+        // Step 1: model file must exist and be readable
+        if !std::path::Path::new(model_path).exists() {
+            anyhow::bail!("Model file not found: {}", model_path);
+        }
+
+        match backend {
+            "llamacpp" => {
+                let client = LlamaCppBackend::with_defaults()?;
+
+                // Step 2: if the right model is already loaded → nothing to do
+                if client.is_ready().await && client.current_model_matches(model_path).await {
+                    tracing::info!(model = model_path, "model already loaded on llamacpp");
+                    return Ok(());
+                }
+
+                // Step 3: trigger systemd restart with model path + gpu layers via env override
+                let gpu_arg = gpu_layers
+                    .map(|n| format!(" --n-gpu-layers {n}"))
+                    .unwrap_or_default();
+                tracing::info!(
+                    model = model_path,
+                    gpu_arg = gpu_arg.trim(),
+                    "restarting llama-server with new model"
+                );
+
+                // Write a drop-in override that sets the model env var
+                let override_dir = "/run/systemd/system/llama-server.service.d";
+                let override_content = format!(
+                    "[Service]\nEnvironment=LLAMA_MODEL={}{}\n",
+                    model_path, gpu_arg
+                );
+
+                if let Err(e) = std::fs::create_dir_all(override_dir) {
+                    anyhow::bail!(
+                        "Cannot write systemd override (are you root?): {e}\n\
+                         Restart llama-server manually with --model {model_path}"
+                    );
+                }
+                std::fs::write(
+                    format!("{override_dir}/model-override.conf"),
+                    override_content,
+                )?;
+
+                let status = tokio::process::Command::new("systemctl")
+                    .args(["daemon-reload"])
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("systemctl daemon-reload failed");
+                }
+
+                let status = tokio::process::Command::new("systemctl")
+                    .args(["restart", "llama-server.service"])
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("systemctl restart llama-server.service failed");
+                }
+
+                Ok(())
+            }
+            other => anyhow::bail!("load_model not supported for backend: {}", other),
+        }
     }
 
-    /// Unload model from backend.
-    pub async fn unload_model(_backend: &str) -> anyhow::Result<()> {
-        anyhow::bail!("Backend unloading not implemented")
+    /// Unload model from backend (graceful stop of llama-server).
+    pub async fn unload_model(backend: &str) -> anyhow::Result<()> {
+        match backend {
+            "llamacpp" => {
+                let status = tokio::process::Command::new("systemctl")
+                    .args(["stop", "llama-server.service"])
+                    .status()
+                    .await?;
+                if !status.success() {
+                    anyhow::bail!("systemctl stop llama-server.service failed");
+                }
+                Ok(())
+            }
+            other => anyhow::bail!("unload_model not supported for backend: {}", other),
+        }
     }
 
-    /// Switch model on backend (hot-reload).
+    /// Switch model: stop current, start with new model.
     pub async fn switch_model(
         backend: &str,
-        _model_path: &str,
-        _gpu_layers: Option<u32>,
+        model_path: &str,
+        gpu_layers: Option<u32>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("Backend switching not implemented for: {}", backend)
+        Self::load_model(backend, model_path, gpu_layers).await
     }
 
     /// Check if a named backend is alive.

@@ -1,8 +1,10 @@
 pub mod api;
+pub mod auth;
 pub mod backends;
 pub mod db;
 pub mod health;
 pub mod inference;
+pub mod metrics;
 pub mod models;
 pub mod nats;
 pub mod orchestrator;
@@ -21,6 +23,7 @@ pub trait VramMonitorTrait: Send + Sync {
 }
 
 use axum::{
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -46,6 +49,8 @@ pub struct AppState {
     pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
     pub router: Arc<BackendRouter>,
     pub orchestrator: OrchestratorHandle,
+    pub api_keys: Arc<std::collections::HashSet<String>>,
+    pub rate_limiter: Arc<auth::KeyedLimiter>,
 }
 
 impl AppState {
@@ -70,6 +75,8 @@ impl AppState {
             ws_sender: Arc::new(ws_sender),
             router,
             orchestrator,
+            api_keys: Arc::new(std::collections::HashSet::new()), // dev mode: no auth
+            rate_limiter: auth::rate_limiter_from_env(),
         }
     }
 }
@@ -160,40 +167,40 @@ impl Config {
 
 }
 
-pub async fn create_router() -> Router<AppState> {
-    Router::new()
-        // Root endpoint
-        .route("/", get(root_handler))
-        // Health check (basic)
-        .route("/health", get(health_handler))
-        // API health check (detailed backend status)
-        .route("/api/health", get(health::health_check_handler))
-        .route("/api/backend/info", get(health::backend_info_handler))
-        // Backends
-        .route("/backends", get(list_backends_handler))
-        // Models
-        .route("/models", get(list_models_handler))
-        .route("/models/:id", get(get_model_handler))
-        .route("/models/scan", post(trigger_scan_handler))
-        // Status
-        .route("/status", get(status_handler))
-        // VRAM
-        .route("/vram", get(vram_handler))
-        // WebSocket
-        .route("/ws", get(websocket::websocket_handler))
-        // OpenAI-compatible inference endpoints
+/// Build the full router. Takes `state` so auth/rate-limit middlewares can
+/// reference the real api_keys and rate_limiter at construction time.
+pub fn create_router(state: AppState) -> Router {
+    // `/v1/*` routes: protected by auth then rate-limiting.
+    // route_layer applies only to matched routes (not to 404s).
+    let inference = Router::new()
         .route("/v1/models", get(inference::list_models_openai_handler))
         .route("/v1/chat/completions", post(inference::chat_completions_handler))
         .route("/v1/embeddings", post(inference::embeddings_handler))
-        // Load/Unload/Switch
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::rate_limit_middleware))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+
+    Router::new()
+        .route("/", get(root_handler))
+        .route("/health", get(health_handler))
+        .route("/api/health", get(health::health_check_handler))
+        .route("/api/backend/info", get(health::backend_info_handler))
+        .route("/api/stats", get(stats_handler))
+        .route("/backends", get(list_backends_handler))
+        .route("/models", get(list_models_handler))
+        .route("/models/:id", get(get_model_handler))
+        .route("/models/scan", post(trigger_scan_handler))
+        .route("/status", get(status_handler))
+        .route("/vram", get(vram_handler))
+        .route("/ws", get(websocket::websocket_handler))
         .route("/load", post(load_model_handler))
         .route("/unload", post(unload_model_handler))
         .route("/switch", post(switch_model_handler))
-        // Add middleware
+        .merge(inference)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(false)),
         )
+        .with_state(state)
 }
 
 use axum::{
@@ -422,6 +429,33 @@ async fn switch_model_handler(
             Json(ApiResponse::error(format!("Switch failed: {}", e)))
         }
     }
+}
+
+async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let depths = state.orchestrator.queue_depths();
+    let in_flight = state.orchestrator.in_flight();
+    let backends = state.router.list().await;
+
+    Json(serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "orchestrator": {
+            "in_flight": in_flight,
+            "queue": {
+                "low":      depths[0],
+                "normal":   depths[1],
+                "high":     depths[2],
+                "critical": depths[3],
+                "total":    depths[0] + depths[1] + depths[2] + depths[3],
+            }
+        },
+        "backends": backends.iter().map(|(cfg, alive, score)| serde_json::json!({
+            "id":       cfg.id,
+            "kind":     cfg.kind.to_string(),
+            "base_url": cfg.base_url,
+            "alive":    alive,
+            "score":    score,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 
