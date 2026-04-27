@@ -23,6 +23,7 @@ mod health;
 mod inference;
 mod models;
 mod nats;
+mod router;
 mod vram;
 mod websocket;
 
@@ -36,6 +37,7 @@ pub trait VramMonitorTrait: Send + Sync {
 }
 
 use db::Database;
+use router::BackendRouter;
 use vram::VramMonitor;
 
 /// Application state shared across handlers
@@ -46,6 +48,7 @@ pub struct AppState {
     config: Arc<Config>,
     pub nats_publisher: Arc<nats::NatsPublisher>,
     pub ws_sender: Arc<tokio::sync::broadcast::Sender<websocket::WsEvent>>,
+    pub router: Arc<BackendRouter>,
 }
 
 /// Configuration from environment variables
@@ -121,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
     // Initialize global WebSocket broadcaster
     let (ws_sender, _) = tokio::sync::broadcast::channel(100);
 
+    // Initialize backend router (VRAM-aware, latency-aware)
+    let backend_router = Arc::new(BackendRouter::from_env());
+    info!("Backend router initialized");
+
     // Create application state
     let app_state = AppState {
         db,
@@ -128,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         nats_publisher,
         ws_sender: Arc::new(ws_sender),
+        router: backend_router,
     };
 
     // Spawn global VRAM monitoring task for WebSocket broadcast

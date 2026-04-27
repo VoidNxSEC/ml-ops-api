@@ -15,14 +15,15 @@ use axum::{
     },
     Json,
 };
-use futures::stream::{self, Stream};
+use bytes::Bytes;
+use futures::stream::{self, unfold, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::backends::llamacpp::LlamaCppBackend;
+use crate::backends::llamacpp::{LlamaCppBackend, LlamaCppConfig};
 use crate::AppState;
 
 // =============================================================================
@@ -212,8 +213,7 @@ pub async fn chat_completions_handler(
     }
     
     if request.stream {
-        // Return SSE stream
-        streaming_response(state, request).await.into_response()
+        streaming_response(state, request).await
     } else {
         // Return single response
         match non_streaming_response(state, request).await {
@@ -329,104 +329,160 @@ async fn non_streaming_response(
     }
 }
 
-async fn streaming_response(
-    _state: AppState,
-    request: ChatCompletionRequest,
-) -> impl IntoResponse {
+async fn streaming_response(state: AppState, request: ChatCompletionRequest) -> Response {
+    let request_id = Uuid::new_v4();
     let model = request.model.clone();
-    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let created = chrono::Utc::now().timestamp();
-    
-    // Create a stream of SSE events
-    let stream = stream::iter(vec![
-        // Initial chunk with role
-        Ok::<_, Infallible>(Event::default().json_data(ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChatChoiceDelta {
-                index: 0,
-                delta: ChatMessageDelta {
-                    role: Some("assistant".to_string()),
-                    content: None,
-                },
-                finish_reason: None,
-            }],
-        }).unwrap()),
-        // Content chunks
-        Ok(Event::default().json_data(ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChatChoiceDelta {
-                index: 0,
-                delta: ChatMessageDelta {
-                    role: None,
-                    content: Some("[Mock Stream] ".to_string()),
-                },
-                finish_reason: None,
-            }],
-        }).unwrap()),
-        Ok(Event::default().json_data(ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChatChoiceDelta {
-                index: 0,
-                delta: ChatMessageDelta {
-                    role: None,
-                    content: Some("Streaming response is under development.".to_string()),
-                },
-                finish_reason: None,
-            }],
-        }).unwrap()),
-        // Final chunk
-        Ok(Event::default().json_data(ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChatChoiceDelta {
-                index: 0,
-                delta: ChatMessageDelta {
-                    role: None,
-                    content: None,
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-        }).unwrap()),
-        Ok(Event::default().data("[DONE]")),
-    ]);
-    
-    Sse::new(stream).keep_alive(KeepAlive::default())
+
+    // Fire-and-forget: publish inference.request.v1
+    {
+        let publisher = state.nats_publisher.clone();
+        let m = model.clone();
+        let msgs = request.messages.len();
+        tokio::spawn(async move {
+            publisher.publish_inference_request(request_id, &m, msgs).await;
+        });
+    }
+
+    // Select best available backend via VRAM-aware router
+    let selected = match state.router.pick().await {
+        Some(b) => b,
+        None => {
+            warn!("no backends available for streaming");
+            return sse_error("No inference backends available".to_string());
+        }
+    };
+
+    let backend = match LlamaCppBackend::new(LlamaCppConfig {
+        base_url: selected.base_url().to_string(),
+        timeout_secs: 300,
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("streaming backend client failed: {}", e);
+            return sse_error(format!("backend unavailable: {e}"));
+        }
+    };
+
+    info!(
+        backend = %selected.config.id,
+        score = selected.score,
+        kind = %selected.kind(),
+        model = %model,
+        "routing streaming request"
+    );
+
+    let mut req_json = serde_json::to_value(&request).unwrap_or_default();
+    req_json["stream"] = serde_json::json!(true);
+
+    let response = match backend.stream_chat_completion(req_json).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("backend stream error on {}: {}", selected.config.id, e);
+            return sse_error(format!("backend error: {e}"));
+        }
+    };
+
+    info!(request_id = %request_id, backend = %selected.config.id, "stream open");
+
+    Sse::new(sse_from_byte_stream(response.bytes_stream()))
+        .keep_alive(
+            KeepAlive::default()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// Convert a reqwest byte stream (SSE from llama.cpp) to axum SSE events.
+///
+/// llama.cpp emits `data: <json>\n\n` per token. We buffer across chunk
+/// boundaries, split on `\n\n`, strip `data: `, and forward raw JSON.
+/// This is zero-copy at the JSON level — no parsing or re-serialization.
+fn sse_from_byte_stream<S>(byte_stream: S) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
+    unfold(
+        (Box::pin(byte_stream), String::new()),
+        |(mut stream, mut buf)| async move {
+            loop {
+                // Emit one SSE event per complete `\n\n`-delimited block
+                if let Some(pos) = buf.find("\n\n") {
+                    let block = buf[..pos].to_string();
+                    buf = buf[pos + 2..].to_string();
+
+                    for line in block.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            return Some((
+                                Ok(Event::default().data(data.to_string())),
+                                (stream, buf),
+                            ));
+                        }
+                    }
+                    continue; // block had no data line (comment/empty), keep going
+                }
+
+                // Need more bytes from backend
+                match stream.next().await {
+                    Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                    _ => return None, // backend closed or error → end stream
+                }
+            }
+        },
+    )
+}
+
+fn sse_error(msg: String) -> Response {
+    let payload = serde_json::json!({
+        "error": { "message": msg, "type": "backend_error" }
+    })
+    .to_string();
+    let s = stream::once(async move { Ok::<_, Infallible>(Event::default().data(payload)) });
+    Sse::new(s).into_response()
 }
 
 pub async fn embeddings_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(request): Json<EmbeddingsRequest>,
 ) -> Result<Json<EmbeddingsResponse>, (StatusCode, Json<serde_json::Value>)> {
     info!("Embeddings request for model: {}", request.model);
-    
-    // Create llamacpp backend client
-    let backend = match LlamaCppBackend::with_defaults() {
+
+    // Select best available backend via router
+    let selected = match state.router.pick().await {
+        Some(b) => b,
+        None => {
+            warn!("no backends available for embeddings");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "No inference backends available",
+                        "type": "service_unavailable"
+                    }
+                })),
+            ));
+        }
+    };
+
+    let backend = match LlamaCppBackend::new(LlamaCppConfig {
+        base_url: selected.base_url().to_string(),
+        timeout_secs: 300,
+    }) {
         Ok(b) => b,
         Err(e) => {
-            warn!("Failed to create llamacpp backend: {}", e);
+            warn!("Failed to create backend client: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": {
-                        "message": "Failed to initialize backend",
+                        "message": "Failed to initialize backend client",
                         "type": "internal_error"
                     }
                 })),
             ));
         }
     };
-    
+
     // Convert request to JSON for proxying
     let request_json = serde_json::to_value(&request).unwrap();
     

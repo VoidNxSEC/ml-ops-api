@@ -181,6 +181,35 @@ impl LlamaCppBackend {
         Ok(response)
     }
 
+    /// Stream chat completion from llama-server (SSE).
+    ///
+    /// Sets `"stream": true` in the request and returns the raw
+    /// reqwest::Response so the caller can consume the byte stream directly,
+    /// avoiding any intermediate buffering of the full response body.
+    pub async fn stream_chat_completion(
+        &self,
+        request_body: serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Accept", "text/event-stream")
+            .json(&request_body)
+            .send()
+            .await
+            .context("Failed to connect to llama-server for streaming")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("llama-server streaming error {status}: {body}");
+        }
+
+        Ok(response)
+    }
+
     /// Proxy embeddings request to llama-server
     ///
     /// Forwards OpenAI-compatible embeddings to llama-server
