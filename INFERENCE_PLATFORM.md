@@ -4,6 +4,8 @@
 **Date**: 2026-04-07  
 **GPU Target**: NVIDIA B200 / B300 (Blackwell) via NVIDIA Inception
 
+> Active execution tracker: see [ROADMAP.md](ROADMAP.md). This document remains the architecture and product overview; shipped-vs-pending status now lives in the roadmap.
+
 ---
 
 ## Overview

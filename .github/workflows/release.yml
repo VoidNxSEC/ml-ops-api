@@ -1,120 +1,44 @@
-name: Release
+name: Publish GitHub Release
 
 on:
   push:
     tags:
-      - 'v*.*.*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g. v1.2.3)'
-        required: true
-        type: string
-
-permissions:
-  contents: write
-
-env:
-  # Use the pushed tag or the manually provided one
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - 'v*'
 
 jobs:
-  # ── Create GitHub Release ────────────────────────────────────────────────────
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.release.outputs.upload_url }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history for release notes
+  release:
+    name: Create GitHub Release
+    runs-on: self-hosted
+    permissions:
+      contents: write
 
-      - name: Create release
-        id: release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag name
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Check for Release Notes
+        id: notes
+        run: |
+          NOTES_FILE="RELEASE-${{ steps.tag.outputs.tag }}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "notes_file=$NOTES_FILE" >> $GITHUB_OUTPUT
+            echo "Release notes found: $NOTES_FILE"
+          else
+            echo "notes_file=" >> $GITHUB_OUTPUT
+            echo "No specific release notes found for ${{ steps.tag.outputs.tag }}. Will use auto-generated."
+          fi
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Release ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          name: Release ${{ steps.tag.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          generate_release_notes: ${{ steps.notes.outputs.notes_file == '' }}
           draft: false
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}  # v1.0.0-rc.1 = prerelease
-
-  # ── Build binaries ───────────────────────────────────────────────────────────
-  build-binaries:
-    name: Binary (${{ matrix.target }})
-    needs: create-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            api/target
-          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        working-directory: api
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package
-        run: |
-          BINARY="api/target/${{ matrix.target }}/release/ml-offload-api"
-          ARCHIVE="ml-offload-api-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: ${{ env.ARCHIVE }}
-
-  # ── Build Nix package ────────────────────────────────────────────────────────
-  build-nix:
-    name: Nix Package
-    needs: create-release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v14
-
-      - name: Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
-
-      - name: Build api package
-        run: nix build .#api --print-build-logs
-
-      - name: Build tensorforge package
-        run: nix build .#forge --print-build-logs
-
-      - name: Package nix result
-        run: |
-          cp -rL result ml-offload-api-nix/
-          tar -czf "ml-offload-api-${{ env.RELEASE_TAG }}-nix.tar.gz" ml-offload-api-nix/
-
-      - name: Upload nix artifact
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: ml-offload-api-${{ env.RELEASE_TAG }}-nix.tar.gz
+          prerelease: false

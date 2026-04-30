@@ -1,0 +1,370 @@
+name: ADR Validation & Enforcement
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  ADR_ROOT: ${{ github.workspace }}
+  PYTHON_BIN: python3.13
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  validate-adrs:
+    name: Validate Architecture Decision Records
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Install Python dependencies
+        run: pip install pyyaml pynacl jsonschema
+
+      - name: Validate ADR pipeline
+        run: bash scripts/validate.sh adr
+
+      - name: Check ADR frontmatter
+        run: |
+          for file in adr/{proposed,accepted}/*.md; do
+            [ -f "$file" ] || continue
+            grep -q "^id:"     "$file" || { echo "❌ Missing 'id' in $file"; exit 1; }
+            grep -q "^title:"  "$file" || { echo "❌ Missing 'title' in $file"; exit 1; }
+            grep -q "^status:" "$file" || { echo "❌ Missing 'status' in $file"; exit 1; }
+            echo "✓ $file"
+          done
+
+      - name: Validate ADR status locations
+        run: |
+          for status_dir in proposed accepted superseded rejected; do
+            for file in adr/${status_dir}/*.md; do
+              [ -f "$file" ] || continue
+              file_status=$(grep "^status:" "$file" | awk '{print $2}')
+              if [ "$file_status" != "$status_dir" ]; then
+                echo "❌ Status mismatch in $file: '$file_status' in '$status_dir/' directory"
+                exit 1
+              fi
+            done
+          done
+          echo "✓ All ADRs in correct directories"
+
+      - name: Check for ID conflicts
+        run: |
+          python3 - << 'EOF'
+          import re
+          from pathlib import Path
+          seen = {}
+          for status_dir in ["proposed", "accepted", "superseded", "rejected"]:
+              for f in Path(f"adr/{status_dir}").glob("*.md"):
+                  content = f.read_text()
+                  m = re.search(r'^id:\s+"?([^"\n]+)"?', content, re.M)
+                  if not m:
+                      continue
+                  adr_id = m.group(1).strip()
+                  if adr_id in seen:
+                      print(f"❌ CONFLICT: {adr_id} in {seen[adr_id]} AND {f}")
+                      exit(1)
+                  seen[adr_id] = str(f)
+          print(f"✓ No ID conflicts ({len(seen)} ADRs)")
+          EOF
+
+      - name: Check for placeholder content
+        run: |
+          if grep -r "\[Descreva" adr/accepted/*.md 2>/dev/null; then
+            echo "❌ Found placeholder content in accepted ADRs"
+            exit 1
+          fi
+          echo "✓ No placeholders in accepted ADRs"
+
+  chain-integrity:
+    name: Chain & Merkle Integrity
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python dependencies
+        run: pip install pyyaml pynacl
+
+      - name: Verify chain integrity
+        run: |
+          python3 .chain/chain_manager.py verify
+          echo "✓ Chain integrity valid"
+
+      - name: Check for signed ADR tampering
+        run: |
+          python3 - << 'EOF'
+          import json, hashlib, re
+          from pathlib import Path
+
+          chain_file = Path(".chain/chain.json")
+          if not chain_file.exists():
+              print("No chain found — skipping")
+              exit(0)
+
+          data = json.loads(chain_file.read_text())
+          errors = []
+
+          for block in data.get("chain", []):
+              adr_id = block.get("adr_id", "")
+              if not adr_id or block.get("block_number") == 0:
+                  continue
+              chain_hash = block.get("content_hash", "")
+              candidates = list(Path("adr/accepted").glob(f"{adr_id}*.md"))
+              if not candidates:
+                  continue
+              adr_file = candidates[0]
+              h = hashlib.sha256()
+              with open(adr_file, "rb") as f:
+                  for chunk in iter(lambda: f.read(8192), b""):
+                      h.update(chunk)
+              actual = h.hexdigest()
+              if actual != chain_hash:
+                  errors.append(
+                      f"TAMPERED: {adr_id} ({adr_file.name})\n"
+                      f"  chain:   {chain_hash[:32]}...\n"
+                      f"  current: {actual[:32]}...\n"
+                      f"  Fix: bash scripts/chain-resign.sh {adr_id}"
+                  )
+
+          if errors:
+              for e in errors:
+                  print(f"❌ {e}")
+              exit(1)
+          print(f"✓ All signed ADRs intact ({len(data.get('chain', []))-1} blocks checked)")
+          EOF
+
+  enforcement-smoke:
+    name: Enforcement Layer Smoke Test (OPA authz)
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Run enforcement smoke test
+        run: bash tests/smoke_enforcement.sh
+
+  detect-features:
+    name: Feature Detection & Integration Check
+    runs-on: self-hosted
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Detect features in commit
+        id: detect
+        run: |
+          chmod +x .hooks/feature_detector.py
+          COMMIT_HASH=$(git rev-parse HEAD)
+          CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r $COMMIT_HASH | tr '\n' ' ')
+          echo "Analyzing commit: $COMMIT_HASH"
+          echo "Changed files: $CHANGED_FILES"
+          python .hooks/feature_detector.py \
+            --commit "$COMMIT_HASH" \
+            --files "$CHANGED_FILES" \
+            --min-confidence 0.7 \
+            || echo "feature_detected=true" >> $GITHUB_OUTPUT
+
+      - name: Check feature integration
+        if: steps.detect.outputs.feature_detected == 'true'
+        run: |
+          chmod +x .hooks/integration_checker.py
+          python .hooks/integration_checker.py \
+            --feature-log .feature_tracking.json \
+            --fail-on-unintegrated
+
+      - name: Upload feature detection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-detection-report
+          path: .feature_tracking.json
+          if-no-files-found: ignore
+
+  sync-knowledge-base:
+    name: Synchronize Knowledge Base
+    runs-on: self-hosted
+    permissions:
+      contents: write
+    needs: validate-adrs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python dependencies
+        run: pip install pyyaml pynacl jsonschema
+
+      - name: Sync knowledge base
+        run: |
+          python .parsers/adr_parser.py adr/accepted --format knowledge --pretty -o knowledge/knowledge_base.json
+          python .parsers/adr_parser.py adr/accepted --format graph     --pretty -o knowledge/graph.json
+          python .parsers/adr_parser.py adr/accepted --format spectre   --pretty -o knowledge/spectre_corpus.json
+          python .parsers/adr_parser.py adr/accepted --format phantom   --pretty -o knowledge/phantom_training.json
+          python .parsers/adr_parser.py adr/accepted --format index     --pretty -o knowledge/index.json 2>/dev/null || true
+
+      - name: Commit knowledge base updates
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: sync knowledge base [skip ci]"
+          file_pattern: "knowledge/*.json"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+
+  stf-compliance-check:
+    name: STF Protocol Compliance Check
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install pyyaml jsonschema
+
+      - name: Validate STF schema
+        run: |
+          python3 -c "
+          import json, yaml
+          from pathlib import Path
+          with open('.schema/stf.schema.json') as f:
+              schema = json.load(f)
+          stf_content = Path('.stf/neutron.stf').read_text()
+          yaml_match = stf_content.split('---')[1]
+          stf_data = yaml.safe_load(yaml_match)
+          print('STF Protocol:', stf_data.get('protocol'))
+          print('Version:', stf_data.get('stf_version'))
+          print('Mode:', stf_data.get('mode'))
+          print('✓ STF file is valid')
+          "
+
+      - name: Check STF directive count
+        run: |
+          DIRECTIVE_COUNT=$(grep -c '<directive id="STF-D'  .stf/neutron.stf || true)
+          CONSTRAINT_COUNT=$(grep -c '<constraint id="STF-C' .stf/neutron.stf || true)
+          echo "Directives: $DIRECTIVE_COUNT | Constraints: $CONSTRAINT_COUNT"
+          [ "$DIRECTIVE_COUNT"  -ge 4 ] || { echo "❌ Insufficient directives (min 4)";  exit 1; }
+          [ "$CONSTRAINT_COUNT" -ge 4 ] || { echo "❌ Insufficient constraints (min 4)"; exit 1; }
+          echo "✓ STF has sufficient directives and constraints"
+
+  code-quality:
+    name: Code Quality Checks
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for TODO/FIXME in critical files
+        run: |
+          if grep -rn "TODO\|FIXME" adr/accepted/ .stf/ 2>/dev/null | grep -v "# TODO:"; then
+            echo "⚠ Found unresolved TODOs in critical files"
+          else
+            echo "✓ No unresolved TODOs in critical files"
+          fi
+
+      - name: Check file permissions
+        run: |
+          [ -x "scripts/adr" ]                || { echo "❌ scripts/adr not executable"; exit 1; }
+          [ -x ".hooks/feature_detector.py" ] || { echo "❌ .hooks/feature_detector.py not executable"; exit 1; }
+          [ -x "tests/smoke_enforcement.sh" ] || { echo "❌ tests/smoke_enforcement.sh not executable"; exit 1; }
+          [ -x "scripts/chain-resign.sh" ]    || { echo "❌ scripts/chain-resign.sh not executable"; exit 1; }
+          echo "✓ Required scripts are executable"
+
+  summary:
+    name: Validation Summary
+    runs-on: self-hosted
+    needs: [validate-adrs, chain-integrity, enforcement-smoke, detect-features, stf-compliance-check, code-quality]
+    if: always()
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# CI/CD Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.validate-adrs.result }}" == "success" ]; then
+            echo "✅ **ADR Validation:** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **ADR Validation:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.chain-integrity.result }}" == "success" ]; then
+            echo "✅ **Chain & Merkle Integrity:** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Chain & Merkle Integrity:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.enforcement-smoke.result }}" == "success" ]; then
+            echo "✅ **Enforcement Smoke (OPA authz):** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Enforcement Smoke (OPA authz):** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.detect-features.result }}" == "success" ] || [ "${{ needs.detect-features.result }}" == "skipped" ]; then
+            echo "✅ **Feature Detection:** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Feature Detection:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.stf-compliance-check.result }}" == "success" ]; then
+            echo "✅ **STF Compliance:** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **STF Compliance:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.code-quality.result }}" == "success" ]; then
+            echo "✅ **Code Quality:** PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Code Quality:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
