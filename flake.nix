@@ -105,10 +105,18 @@
             ML_OFFLOAD_DB_PATH = "./dev.db";
             RUST_LOG           = "info";
             shellHook = ''
+              echo "👋 **Welcome to the ML Offload API & TensorForge Workspace!**"
               echo ""
-              echo "  tensorforge dev shell"
-              echo "  rust:   $(rustc --version)"
-              echo "  python: $(python3 --version)"
+              echo "**🔧 Quick Project Commands:**"
+              echo "- /just dev: Enter the Nix development shell (Rust + CUDA)"
+              echo "- /just dev-python: Enter the Python Nix shell"
+              echo "- /just setup-linux: Bare Linux setup"
+              echo "- /just quick-nix: Quick Nix dev shell"
+              echo ""
+              echo "**🤖 Gemini CLI Commands:**"
+              echo "- /help: View all available commands"
+              echo "- /memory show: See current session context"
+              echo "- /clear: Clear the session"
               echo ""
             '';
           };
